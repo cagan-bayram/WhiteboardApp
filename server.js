@@ -52,6 +52,11 @@ app.prepare().then(() => {
     socket.on('disconnect', () => {
       console.log('Client disconnected');
     });
+    
+    socket.on('draw-shape', ({ roomId, shape }) => {
+      // Broadcast to everyone else in the room
+      socket.to(roomId).emit('draw-shape', shape);
+    });
   });
 
   httpServer.once('error', (err) => {

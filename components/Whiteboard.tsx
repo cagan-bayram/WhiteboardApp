@@ -1,47 +1,35 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
-import { Stage, Layer, Line, Rect, Circle } from 'react-konva'; // Added Rect, Circle
+import React, { useEffect, useRef } from 'react';
+import { Stage, Layer, Line, Rect, Circle } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
-import { useStore } from '@/store/useStore';
+import { useStore, ShapeData } from '@/store/useStore';
 
 let socket: Socket;
 
-interface ShapeData {
-  id: string;
-  tool: string;
-  points?: number[]; // For pencil lines
-  x?: number;        // For shapes
-  y?: number;        // For shapes
-  width?: number;    // For rect
-  height?: number;   // For rect
-  radius?: number;   // For circle
-  color: string;
-  strokeWidth: number;
-}
-
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const [shapes, setShapes] = useState<ShapeData[]>([]);
+  // Use Global State instead of local useState
+  const { tool, color, strokeWidth, shapes, addShape, updateShape, setShapes } = useStore();
   const isDrawing = useRef(false);
-  const { tool, color, strokeWidth } = useStore();
   
   useEffect(() => {
     socket = io(); 
     socket.emit('join-room', roomId);
 
+    // When server sends a shape, we add it to our store
     socket.on('draw-shape', (newShape: ShapeData) => {
-      setShapes((prev) => [...prev, newShape]);
+      addShape(newShape);
     });
 
     socket.on('clear-canvas', () => setShapes([]));
 
     return () => { socket.disconnect(); };
-  }, [roomId]);
+  }, [roomId, addShape, setShapes]);
 
   const handleMouseDown = (e: any) => {
     isDrawing.current = true;
     const pos = e.target.getStage().getPointerPosition();
-    const id = crypto.randomUUID(); // Unique ID for each shape
+    const id = crypto.randomUUID();
 
     let newShape: ShapeData;
 
@@ -54,7 +42,6 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         strokeWidth: tool === 'eraser' ? 20 : strokeWidth,
       };
     } else {
-      // Initialize shape at 0 size
       newShape = {
         id,
         tool,
@@ -68,7 +55,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       };
     }
     
-    setShapes([...shapes, newShape]);
+    // Add to global store
+    addShape(newShape);
   };
 
   const handleMouseMove = (e: any) => {
@@ -76,7 +64,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     
     const stage = e.target.getStage();
     const point = stage.getPointerPosition();
-    const lastShape = shapes[shapes.length - 1];
+    
+    // Get the last shape from global store
+    const lastShapeIndex = shapes.length - 1;
+    const lastShape = { ...shapes[lastShapeIndex] }; // Create copy
 
     if (lastShape.tool === 'pen' || lastShape.tool === 'eraser') {
       lastShape.points = lastShape.points!.concat([point.x, point.y]);
@@ -89,17 +80,14 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       lastShape.radius = Math.sqrt(dx * dx + dy * dy);
     }
     
-    // Update local state
-    shapes.splice(shapes.length - 1, 1, lastShape);
-    setShapes(shapes.concat());
+    // Update global store
+    updateShape(lastShapeIndex, lastShape);
   };
 
   const handleMouseUp = () => {
     isDrawing.current = false;
-    // Broadcast the final shape
-    socket.emit('draw-line', { roomId, line: shapes[shapes.length - 1] }); 
-    // Note: You might want to rename the socket event from 'draw-line' to 'draw-shape' on the server too for clarity, 
-    // but 'draw-line' will work if you update the interface there or just pass 'any'.
+    // Broadcast the final shape to other users
+    socket.emit('draw-shape', { roomId, shape: shapes[shapes.length - 1] });
   };
 
   return (
@@ -110,6 +98,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
+        onTouchStart={handleMouseDown}
+        onTouchMove={handleMouseMove}
+        onTouchEnd={handleMouseUp}
       >
         <Layer>
           {shapes.map((shape, i) => {
