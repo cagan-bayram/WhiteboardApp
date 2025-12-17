@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type Tool = 'pen' | 'eraser' | 'rect' | 'circle';
+export type Tool = 'pen' | 'eraser' | 'rect' | 'circle' | 'image'; // Added 'image'
 
 export interface ShapeData {
   id: string;
@@ -13,14 +13,16 @@ export interface ShapeData {
   radius?: number;
   color: string;
   strokeWidth: number;
+  imageUrl?: string;
 }
+
 
 interface AppState {
   tool: Tool;
   color: string;
   strokeWidth: number;
   shapes: ShapeData[]; // <--- New: Global Shapes Array
-  
+
   setTool: (tool: Tool) => void;
   setColor: (color: string) => void;
   setStrokeWidth: (width: number) => void;
@@ -34,7 +36,7 @@ export const useStore = create<AppState>((set) => ({
   color: '#000000',
   strokeWidth: 5,
   shapes: [],
-  
+
   setTool: (tool) => set({ tool }),
   setColor: (color) => set({ color }),
   setStrokeWidth: (strokeWidth) => set({ strokeWidth }),

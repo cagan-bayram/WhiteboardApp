@@ -5,7 +5,7 @@ import { useStore } from '@/store/useStore';
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import Auth from '@/components/Auth';
-import { Save, LogOut } from 'lucide-react';
+import { Save, LogOut, Image as ImageIcon, Video } from 'lucide-react';
 
 const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
   ssr: false,
@@ -52,6 +52,39 @@ export default function Home() {
       setShapes(data.content); // Restore the shapes!
     }
     setLoading(false);
+  };
+
+  const handleAddVideo = () => {
+    const url = prompt("Enter YouTube URL:");
+    if (url) {
+      // We will extract the video ID and use the thumbnail
+      const videoId = url.split('v=')[1]?.split('&')[0];
+      if (videoId) {
+        const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/0.jpg`;
+        
+        // We treat it like an 'image' shape but we could add a 'videoLink' property to open it later
+        // For this MVP, let's just add it as an image that represents the video.
+        const newShape = {
+          id: crypto.randomUUID(),
+          tool: 'image',
+          x: 100, 
+          y: 100,
+          width: 320,
+          height: 180,
+          color: 'transparent',
+          strokeWidth: 0,
+          imageUrl: thumbnailUrl, // Use YouTube thumbnail
+        };
+        
+        // We need to access the store directly or pass a handler
+        useStore.getState().addShape(newShape);
+        
+        // Note: In a real app, you'd emit this via socket immediately too
+        // socket.emit('draw-shape', ... ) -> This part requires access to the socket instance 
+        // which is currently inside Whiteboard.tsx. 
+        // Ideally, the socket logic should be moved to a custom hook or Context so page.tsx can access it.
+      }
+    }
   };
 
   // Function to Save Board to Supabase
@@ -101,7 +134,9 @@ export default function Home() {
         <input type="color" onChange={(e) => setColor(e.target.value)} className="h-10 w-10 cursor-pointer" />
 
         <div className="w-px h-8 bg-gray-300 mx-2"></div>
-
+        <button onClick={handleAddVideo} className="p-2 text-red-600 hover:bg-red-50 rounded" title="Add Video">
+          <Video size={20}/>
+        </button>
         <button onClick={handleSave} className="p-2 text-green-600 hover:bg-green-50 rounded flex flex-col items-center" title="Save Board">
            <Save size={20}/>
            <span className="text-[9px]">Save</span>
