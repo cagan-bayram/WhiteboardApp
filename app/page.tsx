@@ -29,6 +29,30 @@ export default function Home() {
         >
           Eraser
         </button>
+
+        <button 
+          className={`px-4 py-2 rounded ${tool === 'rect' ? 'bg-blue-500 text-white' : 'bg-gray-100'}`}
+          onClick={() => setTool('rect')}
+        >
+          Rectangle
+        </button>
+        <button 
+          className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-100'}`}
+          onClick={() => setTool('circle')}
+        >
+          Circle
+        </button>
+        {/* Thickness Slider */}
+        <div className="flex flex-col">
+          <span className="text-xs text-gray-500">Size</span>
+          <input 
+            type="range" 
+            min="1" 
+            max="20" 
+            defaultValue="5"
+            onChange={(e) => useStore.getState().setStrokeWidth(Number(e.target.value))}
+          />
+        </div>
         <input 
           type="color" 
           onChange={(e) => setColor(e.target.value)} 

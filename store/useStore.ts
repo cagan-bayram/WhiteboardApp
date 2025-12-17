@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
-type Tool = 'pen' | 'eraser';
+// Added 'rect' and 'circle'
+type Tool = 'pen' | 'eraser' | 'rect' | 'circle';
 
 interface AppState {
   tool: Tool;

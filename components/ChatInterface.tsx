@@ -56,11 +56,11 @@ export default function ChatInterface() {
           </div>
           <div className="p-3 border-t flex gap-2">
             <input
-              className="flex-1 border rounded px-2 py-1 text-sm"
+              className="flex-1 border rounded px-2 py-1 text-sm text-black" // Added text-black
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
-              placeholder="Ask Llama 3.3..."
+              placeholder="Ask about the app..."
             />
             <button onClick={sendMessage} className="bg-blue-600 text-white px-3 py-1 rounded text-sm">Send</button>
           </div>

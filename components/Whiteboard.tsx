@@ -1,81 +1,105 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Stage, Layer, Line } from 'react-konva';
+import { Stage, Layer, Line, Rect, Circle } from 'react-konva'; // Added Rect, Circle
 import { io, Socket } from 'socket.io-client';
 import { useStore } from '@/store/useStore';
 
 let socket: Socket;
 
-interface LineData {
+interface ShapeData {
+  id: string;
   tool: string;
-  points: number[];
+  points?: number[]; // For pencil lines
+  x?: number;        // For shapes
+  y?: number;        // For shapes
+  width?: number;    // For rect
+  height?: number;   // For rect
+  radius?: number;   // For circle
   color: string;
   strokeWidth: number;
 }
 
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const [lines, setLines] = useState<LineData[]>([]);
+  const [shapes, setShapes] = useState<ShapeData[]>([]);
   const isDrawing = useRef(false);
   const { tool, color, strokeWidth } = useStore();
   
-  // Initialize Socket
   useEffect(() => {
-    socket = io(); // Connects to the same host/port by default
-    
+    socket = io(); 
     socket.emit('join-room', roomId);
 
-    socket.on('draw-line', (newLine: LineData) => {
-      setLines((prev) => [...prev, newLine]);
+    socket.on('draw-shape', (newShape: ShapeData) => {
+      setShapes((prev) => [...prev, newShape]);
     });
 
-    socket.on('clear-canvas', () => {
-      setLines([]);
-    });
+    socket.on('clear-canvas', () => setShapes([]));
 
-    return () => {
-      socket.disconnect();
-    };
+    return () => { socket.disconnect(); };
   }, [roomId]);
 
   const handleMouseDown = (e: any) => {
     isDrawing.current = true;
     const pos = e.target.getStage().getPointerPosition();
-    const newLine = {
-      tool,
-      points: [pos.x, pos.y],
-      color: tool === 'eraser' ? '#ffffff' : color, // Simple eraser logic
-      strokeWidth: tool === 'eraser' ? 20 : strokeWidth,
-    };
+    const id = crypto.randomUUID(); // Unique ID for each shape
+
+    let newShape: ShapeData;
+
+    if (tool === 'pen' || tool === 'eraser') {
+      newShape = {
+        id,
+        tool,
+        points: [pos.x, pos.y],
+        color: tool === 'eraser' ? '#ffffff' : color,
+        strokeWidth: tool === 'eraser' ? 20 : strokeWidth,
+      };
+    } else {
+      // Initialize shape at 0 size
+      newShape = {
+        id,
+        tool,
+        x: pos.x,
+        y: pos.y,
+        width: 0,
+        height: 0,
+        radius: 0,
+        color,
+        strokeWidth,
+      };
+    }
     
-    // Add locally immediately
-    setLines([...lines, newLine]);
+    setShapes([...shapes, newShape]);
   };
 
   const handleMouseMove = (e: any) => {
-    // Send cursor position (omitted for brevity, but goes here)
-    
     if (!isDrawing.current) return;
     
     const stage = e.target.getStage();
     const point = stage.getPointerPosition();
+    const lastShape = shapes[shapes.length - 1];
+
+    if (lastShape.tool === 'pen' || lastShape.tool === 'eraser') {
+      lastShape.points = lastShape.points!.concat([point.x, point.y]);
+    } else if (lastShape.tool === 'rect') {
+      lastShape.width = point.x - lastShape.x!;
+      lastShape.height = point.y - lastShape.y!;
+    } else if (lastShape.tool === 'circle') {
+      const dx = point.x - lastShape.x!;
+      const dy = point.y - lastShape.y!;
+      lastShape.radius = Math.sqrt(dx * dx + dy * dy);
+    }
     
-    // Update the last line
-    const lastLine = lines[lines.length - 1];
-    lastLine.points = lastLine.points.concat([point.x, point.y]);
-    
-    // Update local state efficiently
-    lines.splice(lines.length - 1, 1, lastLine);
-    setLines(lines.concat());
-    
-    // Emit only the *new* points or the whole line (throttling recommended for prod)
-    // For simplicity, we sync the final line on MouseUp, but here we could emit live.
+    // Update local state
+    shapes.splice(shapes.length - 1, 1, lastShape);
+    setShapes(shapes.concat());
   };
 
   const handleMouseUp = () => {
     isDrawing.current = false;
-    // Broadcast the finished line to others
-    socket.emit('draw-line', { roomId, line: lines[lines.length - 1] });
+    // Broadcast the final shape
+    socket.emit('draw-line', { roomId, line: shapes[shapes.length - 1] }); 
+    // Note: You might want to rename the socket event from 'draw-line' to 'draw-shape' on the server too for clarity, 
+    // but 'draw-line' will work if you update the interface there or just pass 'any'.
   };
 
   return (
@@ -86,25 +110,46 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
-        onTouchStart={handleMouseDown}
-        onTouchMove={handleMouseMove}
-        onTouchEnd={handleMouseUp}
       >
         <Layer>
-          {lines.map((line, i) => (
-            <Line
-              key={i}
-              points={line.points}
-              stroke={line.color}
-              strokeWidth={line.strokeWidth}
-              tension={0.5}
-              lineCap="round"
-              lineJoin="round"
-              globalCompositeOperation={
-                line.tool === 'eraser' ? 'destination-out' : 'source-over'
-              }
-            />
-          ))}
+          {shapes.map((shape, i) => {
+            if (shape.tool === 'pen' || shape.tool === 'eraser') {
+              return (
+                <Line
+                  key={i}
+                  points={shape.points}
+                  stroke={shape.color}
+                  strokeWidth={shape.strokeWidth}
+                  tension={0.5}
+                  lineCap="round"
+                  lineJoin="round"
+                />
+              );
+            } else if (shape.tool === 'rect') {
+              return (
+                <Rect
+                  key={i}
+                  x={shape.x}
+                  y={shape.y}
+                  width={shape.width}
+                  height={shape.height}
+                  stroke={shape.color}
+                  strokeWidth={shape.strokeWidth}
+                />
+              );
+            } else if (shape.tool === 'circle') {
+              return (
+                <Circle
+                  key={i}
+                  x={shape.x}
+                  y={shape.y}
+                  radius={shape.radius}
+                  stroke={shape.color}
+                  strokeWidth={shape.strokeWidth}
+                />
+              );
+            }
+          })}
         </Layer>
       </Stage>
     </div>
