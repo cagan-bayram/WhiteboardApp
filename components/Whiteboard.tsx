@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef } from 'react';
-import { Stage, Layer, Line, Rect, Circle, Image as KonvaImage } from 'react-konva';
+import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
 import { useStore, ShapeData } from '@/store/useStore';
@@ -16,7 +16,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   const isDrawing = useRef(false);
 
   // Sub-component to load images correctly
-  const URLImage = ({ shape }: { shape: ShapeData }) => {
+  const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }) => {
     const [img] = useImage(shape.imageUrl || '');
     return (
       <KonvaImage
@@ -25,6 +25,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         y={shape.y}
         width={shape.width || 200}
         height={shape.height || 200}
+        onClick={onClick}
+        onTap={onClick}
       />
     );
   };
@@ -36,6 +38,13 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     // When server sends a shape, we add it to our store
     socket.on('draw-shape', (newShape: ShapeData) => {
       addShape(newShape);
+    });
+    
+    socket.on('update-shape', ({ index, shape }: { index: number, shape: ShapeData }) => {
+       // We need to handle updates (like bucket fill) from other users
+       // Note: This requires a slight store refactor to update by ID rather than index for safety,
+       // but for this MVP index matching is okay if synced perfectly.
+       updateShape(index, shape); 
     });
 
     socket.on('clear-canvas', () => setShapes([]));
@@ -95,9 +104,32 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       socket.disconnect();
       window.removeEventListener('paste', handlePaste);
     };
-  }, [roomId, addShape, setShapes]);
+  }, [roomId, addShape, setShapes, updateShape]);
 
   const handleMouseDown = (e: any) => {
+    // 1. Text Tool Logic
+    if (tool === 'text') {
+      const pos = e.target.getStage().getPointerPosition();
+      const text = prompt("Enter text:"); // Simple MVP input
+      if (text) {
+        const newShape: ShapeData = {
+          id: crypto.randomUUID(),
+          tool: 'text',
+          x: pos.x,
+          y: pos.y,
+          text: text,
+          color: color,
+          strokeWidth: 1, // Font size scalar or similar
+        };
+        addShape(newShape);
+        socket.emit('draw-shape', { roomId, shape: newShape });
+      }
+      return;
+    }
+
+    // 2. Bucket Tool Logic (Handled in onClick of shapes, but we stop drawing here)
+    if (tool === 'bucket') return;
+
     isDrawing.current = true;
     const pos = e.target.getStage().getPointerPosition();
     const id = crypto.randomUUID();
@@ -161,6 +193,18 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     socket.emit('draw-shape', { roomId, shape: shapes[shapes.length - 1] });
   };
 
+
+  // 4. Handle Shape Clicks (For Bucket Fill)
+  const handleShapeClick = (index: number) => {
+    if (tool === 'bucket') {
+      const shape = { ...shapes[index] };
+      shape.fill = color; // Fill with current selected color
+      updateShape(index, shape);
+      // We need a new socket event for UPDATING a shape, not just adding
+      socket.emit('update-shape', { roomId, index, shape }); 
+    }
+  };
+  
   return (
     <div className="border bg-white shadow-lg overflow-hidden">
       <Stage
@@ -169,16 +213,63 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
-        onTouchStart={handleMouseDown}
-        onTouchMove={handleMouseMove}
-        onTouchEnd={handleMouseUp}
       >
         <Layer>
           {shapes.map((shape, i) => {
-            if (shape.tool === 'image') {
-              return (<URLImage key={i} shape={shape} />);
+            if (shape.tool === 'image') return <URLImage key={i} shape={shape} onClick={() => handleShapeClick(i)} />;
+            if (shape.tool === 'text') {
+              return (
+                <Text
+                  key={i}
+                  onClick={() => handleShapeClick(i)}
+                  onTap={() => handleShapeClick(i)}
+                  stroke={shape.color}
+                  strokeWidth={shape.strokeWidth}
+                  draggable={tool == 'pen' ? false : false}
+                  x={shape.x}
+                  y={shape.y}
+                  text={shape.text}
+                  fontSize={24}
+                  fill={shape.color} // Text color is 'fill' in Konva
+                />
+              );
             }
-            if (shape.tool === 'pen' || shape.tool === 'eraser') {
+            
+            if (shape.tool === 'rect') {
+              return (
+                <Rect 
+                  key={i}
+                  onClick={() => handleShapeClick(i)}
+                  onTap={() => handleShapeClick(i)}
+                  stroke={shape.color}
+                  strokeWidth={shape.strokeWidth}
+                  fill={shape.fill}
+                  draggable={tool == 'pen' ? false : false}
+                  x={shape.x} 
+                  y={shape.y} 
+                  width={shape.width} 
+                  height={shape.height}
+                />
+              );
+            }
+
+            if (shape.tool === 'circle') {
+              return (
+                <Circle
+                  key={i}
+                  onClick={() => handleShapeClick(i)}
+                  onTap={() => handleShapeClick(i)}
+                  stroke={shape.color}
+                  strokeWidth={shape.strokeWidth}
+                  fill={shape.fill}
+                  draggable={tool == 'pen' ? false : false}
+                  x={shape.x} 
+                  y={shape.y} 
+                  radius={shape.radius}
+                />  
+              );
+            
+            } if (shape.tool === 'pen' || shape.tool === 'eraser') {
               return (
                 <Line
                   key={i}
@@ -188,29 +279,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   tension={0.5}
                   lineCap="round"
                   lineJoin="round"
-                />
-              );
-            } else if (shape.tool === 'rect') {
-              return (
-                <Rect
-                  key={i}
-                  x={shape.x}
-                  y={shape.y}
-                  width={shape.width}
-                  height={shape.height}
-                  stroke={shape.color}
-                  strokeWidth={shape.strokeWidth}
-                />
-              );
-            } else if (shape.tool === 'circle') {
-              return (
-                <Circle
-                  key={i}
-                  x={shape.x}
-                  y={shape.y}
-                  radius={shape.radius}
-                  stroke={shape.color}
-                  strokeWidth={shape.strokeWidth}
+                  // Lines don't usually have 'fill', but they catch clicks
+                  onClick={() => handleShapeClick(i)} 
                 />
               );
             }

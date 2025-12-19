@@ -1,154 +1,110 @@
 'use client';
 import { useEffect, useState } from 'react';
-import dynamic from 'next/dynamic';
-import { useStore } from '@/store/useStore';
-import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import Auth from '@/components/Auth';
-import { Save, LogOut, Image as ImageIcon, Video } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { Plus, LayoutGrid } from 'lucide-react';
 
-const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
-  ssr: false,
-  loading: () => <div className="flex items-center justify-center h-screen">Loading Board...</div>,
-});
-
-export default function Home() {
+export default function Dashboard() {
   const supabase = createClient();
+  const router = useRouter();
   const [session, setSession] = useState<any>(null);
+  const [boards, setBoards] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  
-  // We grab shapes and setShapes from the store
-  const { setTool, setColor, setStrokeWidth, tool, shapes, setShapes } = useStore();
 
   useEffect(() => {
-    // Check Auth Session
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
-      if (session) loadUserBoard(session.user.id);
+      if (session) fetchBoards(session.user.id);
       else setLoading(false);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) loadUserBoard(session.user.id);
+      if (session) fetchBoards(session.user.id);
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  // Function to Load Board from Supabase
-  const loadUserBoard = async (userId: string) => {
-    setLoading(true);
-    // Fetch the most recently updated board for this user
-    const { data, error } = await supabase
+  const fetchBoards = async (userId: string) => {
+    const { data } = await supabase
       .from('whiteboards')
-      .select('content')
+      .select('id, title, created_at')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (data && data.content) {
-      setShapes(data.content); // Restore the shapes!
-    }
+      .order('created_at', { ascending: false });
+    
+    if (data) setBoards(data);
     setLoading(false);
   };
 
-  const handleAddVideo = () => {
-    const url = prompt("Enter YouTube URL:");
-    if (url) {
-      // We will extract the video ID and use the thumbnail
-      const videoId = url.split('v=')[1]?.split('&')[0];
-      if (videoId) {
-        const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/0.jpg`;
-        
-        // We treat it like an 'image' shape but we could add a 'videoLink' property to open it later
-        // For this MVP, let's just add it as an image that represents the video.
-        const newShape = {
-          id: crypto.randomUUID(),
-          tool: 'image',
-          x: 100, 
-          y: 100,
-          width: 320,
-          height: 180,
-          color: 'transparent',
-          strokeWidth: 0,
-          imageUrl: thumbnailUrl, // Use YouTube thumbnail
-        };
-        
-        // We need to access the store directly or pass a handler
-        useStore.getState().addShape(newShape);
-        
-        // Note: In a real app, you'd emit this via socket immediately too
-        // socket.emit('draw-shape', ... ) -> This part requires access to the socket instance 
-        // which is currently inside Whiteboard.tsx. 
-        // Ideally, the socket logic should be moved to a custom hook or Context so page.tsx can access it.
-      }
-    }
-  };
-
-  // Function to Save Board to Supabase
-  const handleSave = async () => {
+  const createNewBoard = async () => {
     if (!session) return;
-    
-    // We are saving the entire 'shapes' array as a JSON blob
-    const { error } = await supabase
+    // 1. Create a new row in Supabase
+    const { data, error } = await supabase
       .from('whiteboards')
       .insert({ 
         user_id: session.user.id, 
-        content: shapes, // Supabase automatically handles the JSON conversion
-        title: 'My Saved Board' 
-      }); 
-      // Note: "insert" creates a NEW row every time (like "Save As"). 
-      // To "Overwrite", we would need the Board ID. 
-      // For now, "insert" is safer to prevent data loss.
+        title: 'New Whiteboard',
+        content: [] 
+      })
+      .select()
+      .single();
 
-    if (error) {
-      alert('Error saving: ' + error.message);
-    } else {
-      alert('Board saved successfully!');
+    if (data) {
+      // 2. Redirect to the new board
+      router.push(`/board/${data.id}`);
     }
   };
 
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-    setShapes([]); // Clear board on logout
-  };
-
-  if (loading) return <div className="flex h-screen items-center justify-center">Loading...</div>;
   if (!session) return <Auth />;
 
   return (
-    <main className="relative w-full h-screen overflow-hidden">
-      {/* Toolbar */}
-      <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-10 bg-white shadow-md p-2 rounded-lg flex gap-4 border items-center">
-        <button className={`px-4 py-2 rounded ${tool === 'pen' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('pen')}>Pencil</button>
-        <button className={`px-4 py-2 rounded ${tool === 'rect' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('rect')}>Rect</button>
-        <button className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('circle')}>Circle</button>
-        <button className={`px-4 py-2 rounded ${tool === 'eraser' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('eraser')}>Eraser</button>
-
-        <div className="flex flex-col w-24">
-           <span className="text-[10px] text-gray-500 text-center">Thickness</span>
-           <input type="range" min="1" max="20" defaultValue="5" onChange={(e) => setStrokeWidth(Number(e.target.value))} />
+    <div className="min-h-screen bg-gray-50 p-8">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex justify-between items-center mb-8">
+          <h1 className="text-3xl font-bold flex items-center gap-2">
+            <LayoutGrid /> My Whiteboards
+          </h1>
+          <div className="flex gap-4">
+             <button onClick={() => supabase.auth.signOut()} className="text-red-600 hover:underline">
+                Sign Out
+             </button>
+             <button 
+               onClick={createNewBoard}
+               className="bg-blue-600 text-white px-6 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700 transition"
+             >
+               <Plus size={20} /> Create New Board
+             </button>
+          </div>
         </div>
-        <input type="color" onChange={(e) => setColor(e.target.value)} className="h-10 w-10 cursor-pointer" />
 
-        <div className="w-px h-8 bg-gray-300 mx-2"></div>
-        <button onClick={handleAddVideo} className="p-2 text-red-600 hover:bg-red-50 rounded" title="Add Video">
-          <Video size={20}/>
-        </button>
-        <button onClick={handleSave} className="p-2 text-green-600 hover:bg-green-50 rounded flex flex-col items-center" title="Save Board">
-           <Save size={20}/>
-           <span className="text-[9px]">Save</span>
-        </button>
-        <button onClick={handleLogout} className="p-2 text-red-600 hover:bg-red-50 rounded flex flex-col items-center" title="Logout">
-           <LogOut size={20}/>
-           <span className="text-[9px]">Logout</span>
-        </button>
+        {loading ? (
+          <p>Loading boards...</p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6">
+            {boards.map((board) => (
+              <div 
+                key={board.id} 
+                onClick={() => router.push(`/board/${board.id}`)}
+                className="bg-white p-6 rounded-xl shadow-sm hover:shadow-md transition cursor-pointer border border-gray-100 flex flex-col h-40 justify-between"
+              >
+                <h3 className="font-semibold text-lg text-gray-800">{board.title || 'Untitled'}</h3>
+                <p className="text-xs text-gray-400">
+                  {new Date(board.created_at).toLocaleDateString()}
+                </p>
+              </div>
+            ))}
+            
+            {/* Empty State */}
+            {boards.length === 0 && (
+              <div className="col-span-full text-center py-20 text-gray-500">
+                You haven't created any whiteboards yet. Click "Create New Board" to start!
+              </div>
+            )}
+          </div>
+        )}
       </div>
-
-      <Whiteboard roomId="default-room" />
-      <ChatInterface />
-    </main>
+    </div>
   );
 }

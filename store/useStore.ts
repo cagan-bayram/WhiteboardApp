@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
-export type Tool = 'pen' | 'eraser' | 'rect' | 'circle' | 'image'; // Added 'image'
+// Added 'text' and 'bucket'
+export type Tool = 'pen' | 'eraser' | 'rect' | 'circle' | 'image' | 'text' | 'bucket'; 
 
 export interface ShapeData {
   id: string;
@@ -11,24 +12,25 @@ export interface ShapeData {
   width?: number;
   height?: number;
   radius?: number;
-  color: string;
+  text?: string;    // New: For text tool
+  fill?: string;    // New: For bucket fill
+  color: string;    // Stroke color
   strokeWidth: number;
   imageUrl?: string;
 }
-
 
 interface AppState {
   tool: Tool;
   color: string;
   strokeWidth: number;
-  shapes: ShapeData[]; // <--- New: Global Shapes Array
-
+  shapes: ShapeData[];
+  
   setTool: (tool: Tool) => void;
   setColor: (color: string) => void;
   setStrokeWidth: (width: number) => void;
-  setShapes: (shapes: ShapeData[]) => void; // <--- New: Overwrite all shapes (for loading)
-  addShape: (shape: ShapeData) => void;     // <--- New: Add one shape
-  updateShape: (index: number, shape: ShapeData) => void; // <--- New: Update while drawing
+  setShapes: (shapes: ShapeData[]) => void;
+  addShape: (shape: ShapeData) => void;
+  updateShape: (index: number, shape: ShapeData) => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -36,7 +38,7 @@ export const useStore = create<AppState>((set) => ({
   color: '#000000',
   strokeWidth: 5,
   shapes: [],
-
+  
   setTool: (tool) => set({ tool }),
   setColor: (color) => set({ color }),
   setStrokeWidth: (strokeWidth) => set({ strokeWidth }),

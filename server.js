@@ -57,6 +57,10 @@ app.prepare().then(() => {
       // Broadcast to everyone else in the room
       socket.to(roomId).emit('draw-shape', shape);
     });
+
+    socket.on('update-shape', ({ roomId, index, shape }) => {
+      socket.to(roomId).emit('update-shape', { index, shape });
+    });
   });
 
   httpServer.once('error', (err) => {
