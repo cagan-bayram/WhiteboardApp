@@ -1,5 +1,6 @@
 'use client';
 import { useEffect, useState } from 'react';
+import React from 'react';
 import dynamic from 'next/dynamic';
 import { useStore } from '@/store/useStore';
 import ChatInterface from '@/components/ChatInterface';
@@ -12,11 +13,12 @@ const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
   loading: () => <div className="flex items-center justify-center h-screen">Loading Board...</div>,
 });
 
-export default function BoardPage({params}: {params: {boardId: string}}) {
+export default function BoardPage({ params }: { params: Promise<{ boardId: string }> }) {
+  const { boardId } = React.use(params);
   const supabase = createClient();
   const [session, setSession] = useState<any>(null);
   const [loading, setLoading] = useState(true);
-  
+
   // We grab shapes and setShapes from the store
   const { setTool, setColor, setStrokeWidth, tool, shapes, setShapes } = useStore();
 
@@ -54,7 +56,7 @@ export default function BoardPage({params}: {params: {boardId: string}}) {
     return () => subscription.unsubscribe();
   }, []);
 
-  
+
 
   const handleAddVideo = () => {
     const url = prompt("Enter YouTube URL:");
@@ -63,13 +65,13 @@ export default function BoardPage({params}: {params: {boardId: string}}) {
       const videoId = url.split('v=')[1]?.split('&')[0];
       if (videoId) {
         const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/0.jpg`;
-        
+
         // We treat it like an 'image' shape but we could add a 'videoLink' property to open it later
         // For this MVP, let's just add it as an image that represents the video.
         const newShape = {
           id: crypto.randomUUID(),
           tool: 'image',
-          x: 100, 
+          x: 100,
           y: 100,
           width: 320,
           height: 180,
@@ -77,10 +79,10 @@ export default function BoardPage({params}: {params: {boardId: string}}) {
           strokeWidth: 0,
           imageUrl: thumbnailUrl, // Use YouTube thumbnail
         };
-        
+
         // We need to access the store directly or pass a handler
         useStore.getState().addShape(newShape);
-        
+
         // Note: In a real app, you'd emit this via socket immediately too
         // socket.emit('draw-shape', ... ) -> This part requires access to the socket instance 
         // which is currently inside Whiteboard.tsx. 
@@ -92,15 +94,15 @@ export default function BoardPage({params}: {params: {boardId: string}}) {
   // Function to Save Board to Supabase
   const handleSave = async () => {
     if (!session) return;
-    
+
     // We are saving the entire 'shapes' array as a JSON blob
     const { error } = await supabase
       .from('whiteboards')
       .upsert({
-        id: params.boardId,
-        user_id: session.user.id, 
+        id: boardId,
+        user_id: session.user.id,
         content: shapes, // Supabase automatically handles the JSON conversion
-        title: 'Untitled Board' 
+        title: 'Untitled Board'
       });
     if (error) {
       alert('Error saving: ' + error.message);
@@ -126,32 +128,32 @@ export default function BoardPage({params}: {params: {boardId: string}}) {
         <button className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('circle')}>Circle</button>
         <button className={`px-4 py-2 rounded ${tool === 'eraser' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('eraser')}>Eraser</button>
         <button className={`px-4 py-2 rounded ${tool === 'text' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('text')} title="Text Tool">
-            <Type size={18} />
+          <Type size={18} />
         </button>
         <button className={`px-4 py-2 rounded ${tool === 'bucket' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('bucket')} title="Fill Color">
-            <PaintBucket size={18} />
+          <PaintBucket size={18} />
         </button>
         <div className="flex flex-col w-24">
-           <span className="text-[10px] text-gray-500 text-center">Thickness</span>
-           <input type="range" min="1" max="20" defaultValue="5" onChange={(e) => setStrokeWidth(Number(e.target.value))} />
+          <span className="text-[10px] text-gray-500 text-center">Thickness</span>
+          <input type="range" min="1" max="20" defaultValue="5" onChange={(e) => setStrokeWidth(Number(e.target.value))} />
         </div>
         <input type="color" onChange={(e) => setColor(e.target.value)} className="h-10 w-10 cursor-pointer" />
 
         <div className="w-px h-8 bg-gray-300 mx-2"></div>
         <button onClick={handleAddVideo} className="p-2 text-red-600 hover:bg-red-50 rounded" title="Add Video">
-          <Video size={20}/>
+          <Video size={20} />
         </button>
         <button onClick={handleSave} className="p-2 text-green-600 hover:bg-green-50 rounded flex flex-col items-center" title="Save Board">
-           <Save size={20}/>
-           <span className="text-[9px]">Save</span>
+          <Save size={20} />
+          <span className="text-[9px]">Save</span>
         </button>
         <button onClick={handleLogout} className="p-2 text-red-600 hover:bg-red-50 rounded flex flex-col items-center" title="Logout">
-           <LogOut size={20}/>
-           <span className="text-[9px]">Logout</span>
+          <LogOut size={20} />
+          <span className="text-[9px]">Logout</span>
         </button>
       </div>
 
-      <Whiteboard roomId={params.boardId} />
+      <Whiteboard roomId={boardId} />
       <ChatInterface />
     </main>
   );
