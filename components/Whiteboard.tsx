@@ -17,7 +17,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
   // Sub-component to load images correctly
   const URLImage = ({ shape, onClick }: { shape: ShapeData, onClick?: () => void }) => {
-    const [img] = useImage(shape.imageUrl || '');
+    const [img] = useImage(shape.imageUrl || '', 'anonymous');
     return (
       <KonvaImage
         onClick={onClick}
@@ -166,7 +166,12 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     const ctx = off.getContext('2d');
     if (!ctx) return;
     ctx.drawImage(exportCanvas, 0, 0);
-    floodFill(off, Math.round(pos.x), Math.round(pos.y), hexToRgba(color));
+    try {
+      floodFill(off, Math.round(pos.x), Math.round(pos.y), hexToRgba(color));
+    } catch (e) {
+      console.warn('Canvas is tainted by cross-origin images. Bucket fill unavailable.', e);
+      return;
+    }
     const dataUrl = off.toDataURL();
 
     const newShape: ShapeData = {
@@ -180,7 +185,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       strokeWidth: 0,
       imageUrl: dataUrl,
     };
-    addShape(newShape);
+    // Insert fill at the bottom so new drawings appear on top
+    setShapes([newShape, ...shapes]);
     socket.emit('draw-shape', { roomId, shape: newShape });
   };
 
