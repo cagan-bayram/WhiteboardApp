@@ -18,12 +18,14 @@ export default function ChatInterface() {
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: input }),
       });
       const data = await res.json();
       setMessages((prev) => [...prev, { role: 'assistant', content: data.reply }]);
     } catch (e) {
       console.error(e);
+      setMessages((prev) => [...prev, { role: 'assistant', content: 'Something went wrong. Please try again.' }]);
     } finally {
       setLoading(false);
     }
