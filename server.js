@@ -61,6 +61,10 @@ app.prepare().then(() => {
     socket.on('update-shape', ({ roomId, index, shape }) => {
       socket.to(roomId).emit('update-shape', { index, shape });
     });
+
+    socket.on('prepend-shape', ({ roomId, shape }) => {
+      socket.to(roomId).emit('prepend-shape', shape);
+    });
   });
 
   httpServer.once('error', (err) => {

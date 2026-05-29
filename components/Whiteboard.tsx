@@ -1,22 +1,34 @@
 'use client';
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
 import { useStore, ShapeData } from '@/store/useStore';
 import Konva from 'konva';
 
-let socket: Socket;
-
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const { tool, color, strokeWidth, shapes, addShape, updateShape, setShapes } = useStore();
+  const { tool, color, strokeWidth, shapes, addShape, prependShape, updateShape, setShapes } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
-  const fillCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
+  const socketRef = useRef<Socket | null>(null);
+  // Stable offscreen canvas reused for bucket fill — never recreated across renders
+  const fillCanvas = useMemo(() => document.createElement('canvas'), []);
+
+  const [dimensions, setDimensions] = useState({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  });
+
+  useEffect(() => {
+    const handleResize = () =>
+      setDimensions({ width: window.innerWidth, height: window.innerHeight });
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // Sub-component to load images correctly
-  const URLImage = ({ shape, onClick }: { shape: ShapeData, onClick?: () => void }) => {
+  const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }) => {
     const [img] = useImage(shape.imageUrl || '', 'anonymous');
     return (
       <KonvaImage
@@ -32,15 +44,19 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   useEffect(() => {
-    socket = io();
+    const socket = io();
+    socketRef.current = socket;
     socket.emit('join-room', roomId);
 
     socket.on('draw-shape', (newShape: ShapeData) => {
       addShape(newShape);
     });
 
-    // NEW: Listen for shape updates (Bucket)
-    socket.on('update-shape', ({ index, shape }: { index: number, shape: ShapeData }) => {
+    socket.on('prepend-shape', (newShape: ShapeData) => {
+      prependShape(newShape);
+    });
+
+    socket.on('update-shape', ({ index, shape }: { index: number; shape: ShapeData }) => {
       updateShape(index, shape);
     });
 
@@ -50,7 +66,6 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       const items = e.clipboardData?.items;
       const text = e.clipboardData?.getData('text');
 
-      // 1. Image Paste
       if (items) {
         for (const item of items) {
           if (item.type.indexOf('image') !== -1) {
@@ -68,7 +83,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   height: 200,
                   color: 'transparent',
                   strokeWidth: 0,
-                  imageUrl: base64
+                  imageUrl: base64,
                 };
                 addShape(newShape);
                 socket.emit('draw-shape', { roomId, shape: newShape });
@@ -79,7 +94,6 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         }
       }
 
-      // 2. YouTube Links
       if (text && text.includes('youtube.com/watch')) {
         const videoId = text.split('v=')[1]?.split('&')[0];
         if (videoId) {
@@ -89,7 +103,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             tool: 'image',
             x: 200, y: 200, width: 320, height: 180,
             color: 'transparent', strokeWidth: 0,
-            imageUrl: thumbnailUrl
+            imageUrl: thumbnailUrl,
           };
           addShape(newShape);
           socket.emit('draw-shape', { roomId, shape: newShape });
@@ -100,23 +114,21 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     window.addEventListener('paste', handlePaste);
     return () => {
       socket.disconnect();
+      socketRef.current = null;
       window.removeEventListener('paste', handlePaste);
     };
-  }, [roomId, addShape, setShapes, updateShape]);
+  }, [roomId, addShape, prependShape, setShapes, updateShape]);
 
-  // HANDLE BUCKET FILL
   const handleShapeClick = (index: number) => {
     if (tool === 'bucket') {
       const shape = { ...shapes[index] };
-      // If it's text, we change the font color. If it's a shape, we change the fill.
       if (shape.tool === 'text') {
         shape.color = color;
       } else {
         shape.fill = color;
       }
-
       updateShape(index, shape);
-      socket.emit('update-shape', { roomId, index, shape });
+      socketRef.current?.emit('update-shape', { roomId, index, shape });
     }
   };
 
@@ -160,94 +172,78 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     const stage = stageRef.current;
     if (!stage) return;
     const exportCanvas = stage.toCanvas({ pixelRatio: 1 });
-    const off = fillCanvasRef.current;
-    off.width = exportCanvas.width;
-    off.height = exportCanvas.height;
-    const ctx = off.getContext('2d');
+    fillCanvas.width = exportCanvas.width;
+    fillCanvas.height = exportCanvas.height;
+    const ctx = fillCanvas.getContext('2d');
     if (!ctx) return;
     ctx.drawImage(exportCanvas, 0, 0);
     try {
-      floodFill(off, Math.round(pos.x), Math.round(pos.y), hexToRgba(color));
+      floodFill(fillCanvas, Math.round(pos.x), Math.round(pos.y), hexToRgba(color));
     } catch (e) {
-      console.warn('Canvas is tainted by cross-origin images. Bucket fill unavailable.', e);
+      console.warn('Canvas tainted by cross-origin images; bucket fill unavailable.', e);
       return;
     }
-    const dataUrl = off.toDataURL();
-
+    const dataUrl = fillCanvas.toDataURL();
     const newShape: ShapeData = {
       id: crypto.randomUUID(),
       tool: 'image',
-      x: 0,
-      y: 0,
-      width: stage.width(),
-      height: stage.height(),
-      color: 'transparent',
-      strokeWidth: 0,
+      x: 0, y: 0,
+      width: stage.width(), height: stage.height(),
+      color: 'transparent', strokeWidth: 0,
       imageUrl: dataUrl,
     };
-    // Insert fill at the bottom so new drawings appear on top
-    setShapes([newShape, ...shapes]);
-    socket.emit('draw-shape', { roomId, shape: newShape });
+    // Insert at index 0 so new strokes drawn afterward appear above the fill
+    prependShape(newShape);
+    socketRef.current?.emit('prepend-shape', { roomId, shape: newShape });
   };
 
   const handleMouseDown = async (e: any) => {
-    // 1. Text Tool
     if (tool === 'text') {
       const pos = e.target.getStage().getPointerPosition();
-      const text = prompt("Enter text:");
-      if (text) {
+      const text = prompt('Enter text:');
+      if (text?.trim()) {
         const newShape: ShapeData = {
           id: crypto.randomUUID(),
           tool: 'text',
           x: pos.x,
           y: pos.y,
-          text: text,
+          text: text.trim(),
           color: color,
-          strokeWidth: 24, // Use strokeWidth as FontSize
+          strokeWidth: 24,
         };
         addShape(newShape);
-        socket.emit('draw-shape', { roomId, shape: newShape });
+        socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
       }
       return;
     }
 
-    // 2. Bucket Tool (Stop drawing)
     if (tool === 'bucket') {
       const pos = e.target.getStage().getPointerPosition();
       if (pos) await handleBucketFill(pos);
       return;
     }
 
-    // 3. Drawing Logic
     isDrawing.current = true;
     const pos = e.target.getStage().getPointerPosition();
     const id = crypto.randomUUID();
-
     let newShape: ShapeData;
 
     if (tool === 'pen' || tool === 'eraser') {
       newShape = {
-        id,
-        tool,
+        id, tool,
         points: [pos.x, pos.y],
         color: tool === 'eraser' ? '#ffffff' : color,
         strokeWidth: tool === 'eraser' ? 20 : strokeWidth,
       };
     } else {
       newShape = {
-        id,
-        tool,
-        x: pos.x,
-        y: pos.y,
-        width: 0,
-        height: 0,
-        radius: 0,
-        color,
-        strokeWidth,
-        fill: 'transparent'
+        id, tool,
+        x: pos.x, y: pos.y,
+        width: 0, height: 0, radius: 0,
+        color, strokeWidth,
+        fill: 'transparent',
       };
     }
-
     addShape(newShape);
   };
 
@@ -257,6 +253,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     const stage = e.target.getStage();
     const point = stage.getPointerPosition();
     const lastShapeIndex = shapes.length - 1;
+    if (lastShapeIndex < 0) return;
     const lastShape = { ...shapes[lastShapeIndex] };
 
     if (lastShape.tool === 'pen' || lastShape.tool === 'eraser') {
@@ -269,14 +266,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       const dy = point.y - lastShape.y!;
       lastShape.radius = Math.sqrt(dx * dx + dy * dy);
     }
-
     updateShape(lastShapeIndex, lastShape);
   };
 
   const handleMouseUp = () => {
-    if (isDrawing.current) {
-      isDrawing.current = false;
-      socket.emit('draw-shape', { roomId, shape: shapes[shapes.length - 1] });
+    if (!isDrawing.current) return;
+    isDrawing.current = false;
+    // Read from store directly to avoid stale closure
+    const currentShapes = useStore.getState().shapes;
+    const lastShape = currentShapes[currentShapes.length - 1];
+    if (lastShape) {
+      socketRef.current?.emit('draw-shape', { roomId, shape: lastShape });
     }
   };
 
@@ -284,8 +284,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     <div className="border bg-white shadow-lg overflow-hidden">
       <Stage
         ref={stageRef}
-        width={window.innerWidth}
-        height={window.innerHeight}
+        width={dimensions.width}
+        height={dimensions.height}
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
@@ -296,27 +296,27 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         <Layer>
           {shapes.map((shape, i) => {
             if (shape.tool === 'image') {
-              return <URLImage key={i} shape={shape} onClick={() => handleShapeClick(i)} />;
+              return <URLImage key={shape.id} shape={shape} onClick={() => handleShapeClick(i)} />;
             }
             if (shape.tool === 'text') {
               return (
                 <Text
-                  key={i}
+                  key={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   x={shape.x}
                   y={shape.y}
                   text={shape.text}
                   fontSize={shape.strokeWidth || 24}
-                  fill={shape.color} // For text, 'fill' is the font color
-                  draggable={tool === 'pen' ? false : true} // Allow dragging text if not drawing
+                  fill={shape.color}
+                  draggable={tool !== 'pen'}
                 />
               );
             }
             if (shape.tool === 'pen' || shape.tool === 'eraser') {
               return (
                 <Line
-                  key={i}
+                  key={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   points={shape.points}
@@ -325,7 +325,6 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   tension={0.5}
                   lineCap="round"
                   lineJoin="round"
-                  // THE MAGIC: Enable fill and closed for pencil lines
                   fill={shape.tool === 'eraser' ? undefined : shape.fill}
                   closed={!!shape.fill}
                 />
@@ -333,7 +332,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             } else if (shape.tool === 'rect') {
               return (
                 <Rect
-                  key={i}
+                  key={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   x={shape.x}
@@ -348,7 +347,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             } else if (shape.tool === 'circle') {
               return (
                 <Circle
-                  key={i}
+                  key={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   x={shape.x}

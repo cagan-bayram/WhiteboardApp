@@ -1,12 +1,12 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import React from 'react';
 import dynamic from 'next/dynamic';
 import { useStore } from '@/store/useStore';
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import Auth from '@/components/Auth';
-import { Save, LogOut, Image as ImageIcon, Video, Type, PaintBucket } from 'lucide-react';
+import { Save, LogOut, Video, Type, PaintBucket } from 'lucide-react';
 
 const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
   ssr: false,
@@ -15,94 +15,73 @@ const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
 
 export default function BoardPage({ params }: { params: Promise<{ boardId: string }> }) {
   const { boardId } = React.use(params);
-  const supabase = createClient();
+  const supabase = useMemo(() => createClient(), []);
   const [session, setSession] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [boardTitle, setBoardTitle] = useState('Untitled Board');
 
-  // We grab shapes and setShapes from the store
   const { setTool, setColor, setStrokeWidth, tool, shapes, setShapes } = useStore();
 
-  // Function to Load Board from Supabase
-  const loadUserBoard = async (userId: string) => {
-    setLoading(true);
-    // Fetch the most recently updated board for this user
-    const { data, error } = await supabase
-      .from('whiteboards')
-      .select('content')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (data && data.content) {
-      setShapes(data.content); // Restore the shapes!
-    }
-    setLoading(false);
-  };
-
   useEffect(() => {
-    // Check Auth Session
+    const loadBoard = async (userId: string) => {
+      setLoading(true);
+      const { data } = await supabase
+        .from('whiteboards')
+        .select('content, title')
+        .eq('id', boardId)
+        .eq('user_id', userId)
+        .single();
+
+      if (data) {
+        if (data.content) setShapes(data.content);
+        setBoardTitle(data.title || 'Untitled Board');
+      }
+      setLoading(false);
+    };
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
-      if (session) loadUserBoard(session.user.id);
+      if (session) loadBoard(session.user.id);
       else setLoading(false);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) loadUserBoard(session.user.id);
+      // Only reload board on explicit sign-in; ignore token refreshes to preserve unsaved work
+      if (session && _event === 'SIGNED_IN') loadBoard(session.user.id);
     });
 
     return () => subscription.unsubscribe();
-  }, []);
-
-
+  }, [boardId, supabase, setShapes]);
 
   const handleAddVideo = () => {
-    const url = prompt("Enter YouTube URL:");
+    const url = prompt('Enter YouTube URL:');
     if (url) {
-      // We will extract the video ID and use the thumbnail
       const videoId = url.split('v=')[1]?.split('&')[0];
       if (videoId) {
         const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/0.jpg`;
-
-        // We treat it like an 'image' shape but we could add a 'videoLink' property to open it later
-        // For this MVP, let's just add it as an image that represents the video.
         const newShape = {
           id: crypto.randomUUID(),
           tool: 'image',
-          x: 100,
-          y: 100,
-          width: 320,
-          height: 180,
-          color: 'transparent',
-          strokeWidth: 0,
-          imageUrl: thumbnailUrl, // Use YouTube thumbnail
+          x: 100, y: 100,
+          width: 320, height: 180,
+          color: 'transparent', strokeWidth: 0,
+          imageUrl: thumbnailUrl,
         };
-
-        // We need to access the store directly or pass a handler
         useStore.getState().addShape(newShape);
-
-        // Note: In a real app, you'd emit this via socket immediately too
-        // socket.emit('draw-shape', ... ) -> This part requires access to the socket instance 
-        // which is currently inside Whiteboard.tsx. 
-        // Ideally, the socket logic should be moved to a custom hook or Context so page.tsx can access it.
       }
     }
   };
 
-  // Function to Save Board to Supabase
   const handleSave = async () => {
     if (!session) return;
-
-    // We are saving the entire 'shapes' array as a JSON blob
     const { error } = await supabase
       .from('whiteboards')
       .upsert({
         id: boardId,
         user_id: session.user.id,
-        content: shapes, // Supabase automatically handles the JSON conversion
-        title: 'Untitled Board'
+        content: shapes,
+        title: boardTitle,
       });
     if (error) {
       alert('Error saving: ' + error.message);
@@ -113,7 +92,7 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    setShapes([]); // Clear board on logout
+    setShapes([]);
   };
 
   if (loading) return <div className="flex h-screen items-center justify-center">Loading...</div>;
