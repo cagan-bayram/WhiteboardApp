@@ -7,7 +7,7 @@ import { useStore } from '@/store/useStore';
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import Auth from '@/components/Auth';
-import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check } from 'lucide-react';
+import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check, MousePointer2 } from 'lucide-react';
 
 const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
   ssr: false,
@@ -142,6 +142,9 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
           <span className="text-[9px]">Home</span>
         </button>
         <div className="w-px h-8 bg-gray-300"></div>
+        <button className={`px-4 py-2 rounded ${tool === 'select' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('select')} title="Select / Move / Resize">
+          <MousePointer2 size={18} />
+        </button>
         <button className={`px-4 py-2 rounded ${tool === 'pen' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('pen')}>Pencil</button>
         <button className={`px-4 py-2 rounded ${tool === 'rect' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('rect')}>Rect</button>
         <button className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('circle')}>Circle</button>

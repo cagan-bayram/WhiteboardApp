@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type Tool = 'pen' | 'eraser' | 'rect' | 'circle' | 'image' | 'text' | 'bucket' | 'video';
+export type Tool = 'select' | 'pen' | 'eraser' | 'rect' | 'circle' | 'image' | 'text' | 'bucket' | 'video';
 
 export interface ShapeData {
   id: string;
@@ -11,6 +11,7 @@ export interface ShapeData {
   width?: number;
   height?: number;
   radius?: number;
+  rotation?: number;
   text?: string;
   fill?: string;
   color: string;
@@ -42,7 +43,7 @@ interface AppState {
 }
 
 export const useStore = create<AppState>((set) => ({
-  tool: 'pen',
+  tool: 'select',
   color: '#000000',
   strokeWidth: 5,
   shapes: [],
