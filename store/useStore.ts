@@ -31,6 +31,7 @@ interface AppState {
   addShape: (shape: ShapeData) => void;
   prependShape: (shape: ShapeData) => void;
   updateShape: (index: number, shape: ShapeData) => void;
+  updateShapeById: (id: string, shape: ShapeData) => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -46,6 +47,13 @@ export const useStore = create<AppState>((set) => ({
   addShape: (shape) => set((state) => ({ shapes: [...state.shapes, shape] })),
   prependShape: (shape) => set((state) => ({ shapes: [shape, ...state.shapes] })),
   updateShape: (index, shape) => set((state) => {
+    const newShapes = [...state.shapes];
+    newShapes[index] = shape;
+    return { shapes: newShapes };
+  }),
+  updateShapeById: (id, shape) => set((state) => {
+    const index = state.shapes.findIndex((s) => s.id === id);
+    if (index === -1) return state;
     const newShapes = [...state.shapes];
     newShapes[index] = shape;
     return { shapes: newShapes };

@@ -12,11 +12,14 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/*
+ * This app is designed as a light-themed UI (white/gray cards with dark text).
+ * We intentionally do NOT flip to a dark palette based on the OS setting, because
+ * the component backgrounds are hardcoded light — flipping only the text color
+ * made default-colored text (e.g. chat messages) unreadable on light surfaces.
+ */
+:root {
+  color-scheme: light;
 }
 
 body {

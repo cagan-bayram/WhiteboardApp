@@ -8,18 +8,20 @@ export default function Auth() {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [isSignUp, setIsSignUp] = useState(false);
+  const [message, setMessage] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    setMessage(null);
 
     if (isSignUp) {
       const { error } = await supabase.auth.signUp({ email, password });
-      if (error) alert(error.message);
-      else alert('Check your email for the confirmation link!');
+      if (error) setMessage({ type: 'error', text: error.message });
+      else setMessage({ type: 'success', text: 'Check your email for the confirmation link!' });
     } else {
       const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) alert(error.message);
+      if (error) setMessage({ type: 'error', text: error.message });
     }
     setLoading(false);
   };
@@ -54,6 +56,11 @@ export default function Auth() {
           >
             {loading ? 'Loading...' : isSignUp ? 'Sign Up' : 'Log In'}
           </button>
+          {message && (
+            <p className={`text-sm text-center ${message.type === 'error' ? 'text-red-600' : 'text-green-600'}`}>
+              {message.text}
+            </p>
+          )}
         </form>
         <button
           onClick={() => setIsSignUp(!isSignUp)}

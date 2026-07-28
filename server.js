@@ -58,8 +58,8 @@ app.prepare().then(() => {
       socket.to(roomId).emit('draw-shape', shape);
     });
 
-    socket.on('update-shape', ({ roomId, index, shape }) => {
-      socket.to(roomId).emit('update-shape', { index, shape });
+    socket.on('update-shape', ({ roomId, id, shape }) => {
+      socket.to(roomId).emit('update-shape', { id, shape });
     });
 
     socket.on('prepend-shape', ({ roomId, shape }) => {

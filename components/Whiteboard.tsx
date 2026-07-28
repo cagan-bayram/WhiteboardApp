@@ -7,8 +7,26 @@ import useImage from 'use-image';
 import { useStore, ShapeData } from '@/store/useStore';
 import Konva from 'konva';
 
+// Defined at module scope (not inside Whiteboard) so its component identity is
+// stable across renders — otherwise every re-render remounts each image and
+// reloads it via useImage, causing visible flicker while drawing.
+const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }) => {
+  const [img] = useImage(shape.imageUrl || '', 'anonymous');
+  return (
+    <KonvaImage
+      onClick={onClick}
+      onTap={onClick}
+      image={img}
+      x={shape.x}
+      y={shape.y}
+      width={shape.width || 200}
+      height={shape.height || 200}
+    />
+  );
+};
+
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const { tool, color, strokeWidth, shapes, addShape, prependShape, updateShape, setShapes } = useStore();
+  const { tool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, setShapes } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -20,28 +38,27 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     height: window.innerHeight,
   });
 
+  // Inline text editing: when the text tool is used, we show a real <textarea>
+  // at the click position instead of a blocking prompt().
+  const [textEditor, setTextEditor] = useState<{ x: number; y: number } | null>(null);
+  const [textValue, setTextValue] = useState('');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Focus the editor after it mounts (via a timeout so the click that opened it
+  // has fully settled — autoFocus mid-click can immediately blur it shut).
+  useEffect(() => {
+    if (textEditor) {
+      const t = setTimeout(() => textareaRef.current?.focus(), 0);
+      return () => clearTimeout(t);
+    }
+  }, [textEditor]);
+
   useEffect(() => {
     const handleResize = () =>
       setDimensions({ width: window.innerWidth, height: window.innerHeight });
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
-
-  // Sub-component to load images correctly
-  const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }) => {
-    const [img] = useImage(shape.imageUrl || '', 'anonymous');
-    return (
-      <KonvaImage
-        onClick={onClick}
-        onTap={onClick}
-        image={img}
-        x={shape.x}
-        y={shape.y}
-        width={shape.width || 200}
-        height={shape.height || 200}
-      />
-    );
-  };
 
   useEffect(() => {
     const socket = io();
@@ -56,8 +73,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       prependShape(newShape);
     });
 
-    socket.on('update-shape', ({ index, shape }: { index: number; shape: ShapeData }) => {
-      updateShape(index, shape);
+    socket.on('update-shape', ({ id, shape }: { id: string; shape: ShapeData }) => {
+      updateShapeById(id, shape);
     });
 
     socket.on('clear-canvas', () => setShapes([]));
@@ -117,7 +134,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       socketRef.current = null;
       window.removeEventListener('paste', handlePaste);
     };
-  }, [roomId, addShape, prependShape, setShapes, updateShape]);
+  }, [roomId, addShape, prependShape, setShapes, updateShapeById]);
 
   const handleShapeClick = (index: number) => {
     if (tool === 'bucket') {
@@ -128,7 +145,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         shape.fill = color;
       }
       updateShape(index, shape);
-      socketRef.current?.emit('update-shape', { roomId, index, shape });
+      socketRef.current?.emit('update-shape', { roomId, id: shape.id, shape });
     }
   };
 
@@ -192,28 +209,44 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       color: 'transparent', strokeWidth: 0,
       imageUrl: dataUrl,
     };
-    // Insert at index 0 so new strokes drawn afterward appear above the fill
-    prependShape(newShape);
-    socketRef.current?.emit('prepend-shape', { roomId, shape: newShape });
+    // Append on top: the fill is a full snapshot of the current canvas, so the
+    // newest fill must render above earlier ones (otherwise a second fill, e.g.
+    // white over black, lands behind the first and is invisible). Strokes drawn
+    // afterward are appended later and still render above the fill.
+    addShape(newShape);
+    socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
+  };
+
+  const commitText = () => {
+    if (textEditor && textValue.trim()) {
+      const newShape: ShapeData = {
+        id: crypto.randomUUID(),
+        tool: 'text',
+        x: textEditor.x,
+        y: textEditor.y,
+        text: textValue.trim(),
+        color: color,
+        strokeWidth: 24,
+      };
+      addShape(newShape);
+      socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
+    }
+    setTextEditor(null);
+    setTextValue('');
+  };
+
+  const cancelText = () => {
+    setTextEditor(null);
+    setTextValue('');
   };
 
   const handleMouseDown = async (e: any) => {
     if (tool === 'text') {
+      // If an editor is already open, its onBlur will commit it — don't open
+      // another on the same click.
+      if (textEditor) return;
       const pos = e.target.getStage().getPointerPosition();
-      const text = prompt('Enter text:');
-      if (text?.trim()) {
-        const newShape: ShapeData = {
-          id: crypto.randomUUID(),
-          tool: 'text',
-          x: pos.x,
-          y: pos.y,
-          text: text.trim(),
-          color: color,
-          strokeWidth: 24,
-        };
-        addShape(newShape);
-        socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
-      }
+      if (pos) setTextEditor({ x: pos.x, y: pos.y });
       return;
     }
 
@@ -281,7 +314,45 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   return (
-    <div className="border bg-white shadow-lg overflow-hidden">
+    <div className="relative border bg-white shadow-lg overflow-hidden">
+      {textEditor && (
+        <textarea
+          ref={textareaRef}
+          value={textValue}
+          onChange={(e) => setTextValue(e.target.value)}
+          onBlur={commitText}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              commitText();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              cancelText();
+            }
+          }}
+          placeholder="Type text, Enter to add"
+          rows={1}
+          style={{
+            position: 'absolute',
+            top: textEditor.y,
+            left: textEditor.x,
+            zIndex: 30,
+            color: color,
+            fontSize: 24,
+            lineHeight: 1.2,
+            background: '#ffffff',
+            border: '2px solid #3b82f6',
+            borderRadius: 4,
+            outline: 'none',
+            padding: '2px 6px',
+            margin: 0,
+            resize: 'none',
+            overflow: 'hidden',
+            minWidth: 160,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+          }}
+        />
+      )}
       <Stage
         ref={stageRef}
         width={dimensions.width}

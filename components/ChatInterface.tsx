@@ -50,8 +50,8 @@ export default function ChatInterface() {
           </div>
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
             {messages.map((m, i) => (
-              <div key={i} className={`p-2 rounded max-w-[80%] ${m.role === 'user' ? 'bg-blue-100 ml-auto' : 'bg-gray-100'}`}>
-                <p className="text-sm">{m.content}</p>
+              <div key={i} className={`p-2 rounded max-w-[80%] ${m.role === 'user' ? 'bg-blue-600 text-white ml-auto' : 'bg-gray-100 text-gray-900'}`}>
+                <p className="text-sm whitespace-pre-wrap">{m.content}</p>
               </div>
             ))}
             {loading && <p className="text-xs text-gray-500 italic">Thinking...</p>}
