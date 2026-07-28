@@ -79,15 +79,16 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
       showToast('Could not read a YouTube video ID from that URL.');
       return;
     }
-    const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/0.jpg`;
-    useStore.getState().addShape({
+    const shape = {
       id: crypto.randomUUID(),
-      tool: 'image',
+      tool: 'video',
       x: 100, y: 100,
-      width: 320, height: 180,
+      width: 400, height: 225,
       color: 'transparent', strokeWidth: 0,
-      imageUrl: thumbnailUrl,
-    });
+      videoId,
+    };
+    useStore.getState().addShape(shape);
+    useStore.getState().broadcastShape?.(shape);
     setVideoUrl('');
     setShowVideoModal(false);
   };

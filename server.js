@@ -62,6 +62,10 @@ app.prepare().then(() => {
       socket.to(roomId).emit('update-shape', { id, shape });
     });
 
+    socket.on('delete-shape', ({ roomId, id }) => {
+      socket.to(roomId).emit('delete-shape', { id });
+    });
+
     socket.on('prepend-shape', ({ roomId, shape }) => {
       socket.to(roomId).emit('prepend-shape', shape);
     });
