@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
-import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage } from 'react-konva';
+import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage, Transformer } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
 import { useStore, ShapeData } from '@/store/useStore';
@@ -10,10 +10,23 @@ import Konva from 'konva';
 // Defined at module scope (not inside Whiteboard) so its component identity is
 // stable across renders — otherwise every re-render remounts each image and
 // reloads it via useImage, causing visible flicker while drawing.
-const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }) => {
+const URLImage = ({
+  shape,
+  onClick,
+  draggable,
+  onDragEnd,
+  onTransformEnd,
+}: {
+  shape: ShapeData;
+  onClick?: () => void;
+  draggable?: boolean;
+  onDragEnd?: (e: Konva.KonvaEventObject<DragEvent>) => void;
+  onTransformEnd?: (e: Konva.KonvaEventObject<Event>) => void;
+}) => {
   const [img] = useImage(shape.imageUrl || '', 'anonymous');
   return (
     <KonvaImage
+      id={shape.id}
       onClick={onClick}
       onTap={onClick}
       image={img}
@@ -21,6 +34,10 @@ const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }
       y={shape.y}
       width={shape.width || 200}
       height={shape.height || 200}
+      rotation={shape.rotation || 0}
+      draggable={draggable}
+      onDragEnd={onDragEnd}
+      onTransformEnd={onTransformEnd}
     />
   );
 };
@@ -141,10 +158,13 @@ const VideoEmbed = ({
 };
 
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const { tool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, setShapes, setBroadcastShape } = useStore();
+  const { tool, setTool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, setShapes, setBroadcastShape } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
   const socketRef = useRef<Socket | null>(null);
+  const transformerRef = useRef<Konva.Transformer>(null);
+  // Currently selected shape (only meaningful with the 'select' tool).
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   // Stable offscreen canvas reused for bucket fill — never recreated across renders
   const fillCanvas = useMemo(() => document.createElement('canvas'), []);
 
@@ -174,6 +194,21 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  // Leaving the select tool clears any active selection.
+  useEffect(() => {
+    if (tool !== 'select') setSelectedId(null);
+  }, [tool]);
+
+  // Attach the Konva Transformer to the currently selected node.
+  useEffect(() => {
+    const tr = transformerRef.current;
+    const stage = stageRef.current;
+    if (!tr || !stage) return;
+    const node = tool === 'select' && selectedId ? stage.findOne('#' + selectedId) : null;
+    tr.nodes(node ? [node as Konva.Node] : []);
+    tr.getLayer()?.batchDraw();
+  }, [selectedId, tool, shapes]);
 
   useEffect(() => {
     const socket = io();
@@ -234,6 +269,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                 };
                 addShape(newShape);
                 socket.emit('draw-shape', { roomId, shape: newShape });
+                // Pasted images are one-shot inserts: drop to the cursor and
+                // select the new image so it can be moved/resized right away.
+                useStore.getState().setTool('select');
+                setSelectedId(newShape.id);
               };
               reader.readAsDataURL(blob);
             }
@@ -287,7 +326,51 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       }
       updateShape(index, shape);
       socketRef.current?.emit('update-shape', { roomId, id: shape.id, shape });
+    } else if (tool === 'select') {
+      setSelectedId(shapes[index].id);
     }
+  };
+
+  // Commit a moved/resized node's geometry back into the store and sync it.
+  const commitNode = (id: string, patch: Partial<ShapeData>) => {
+    const shape = shapes.find((s) => s.id === id);
+    if (!shape) return;
+    const updated = { ...shape, ...patch };
+    updateShapeById(id, updated);
+    socketRef.current?.emit('update-shape', { roomId, id, shape: updated });
+  };
+
+  const handleDragEnd = (id: string) => (e: Konva.KonvaEventObject<DragEvent>) => {
+    commitNode(id, { x: e.target.x(), y: e.target.y() });
+  };
+
+  const handleTransformEnd = (id: string) => (e: Konva.KonvaEventObject<Event>) => {
+    const node = e.target;
+    const scaleX = node.scaleX();
+    const scaleY = node.scaleY();
+    // Bake the transform's scale back into real dimensions and reset the scale,
+    // so the stored shape stays clean (scale always 1).
+    node.scaleX(1);
+    node.scaleY(1);
+    const shape = shapes.find((s) => s.id === id);
+    if (!shape) return;
+    const patch: Partial<ShapeData> = { x: node.x(), y: node.y(), rotation: node.rotation() };
+    if (shape.tool === 'rect' || shape.tool === 'image') {
+      patch.width = Math.max(5, (shape.width || node.width()) * scaleX);
+      patch.height = Math.max(5, (shape.height || node.height()) * scaleY);
+    } else if (shape.tool === 'circle') {
+      patch.radius = Math.max(5, (shape.radius || 0) * Math.max(scaleX, scaleY));
+    } else if (shape.tool === 'text') {
+      patch.strokeWidth = Math.max(6, (shape.strokeWidth || 24) * scaleY);
+    } else if (shape.tool === 'pen' || shape.tool === 'eraser') {
+      // Freehand strokes have no width/height — bake the scale into every point
+      // coordinate (x on even indices, y on odd), and scale the line thickness by
+      // the average factor so it reads like a proportionally resized drawing.
+      const pts = shape.points || [];
+      patch.points = pts.map((v, idx) => (idx % 2 === 0 ? v * scaleX : v * scaleY));
+      patch.strokeWidth = Math.max(1, (shape.strokeWidth || 1) * ((scaleX + scaleY) / 2));
+    }
+    commitNode(id, patch);
   };
 
   const hexToRgba = (hex: string): [number, number, number, number] => {
@@ -371,6 +454,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       };
       addShape(newShape);
       socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
+      // Return to the cursor so the just-placed text can be moved/resized.
+      setTool('select');
+      setSelectedId(newShape.id);
     }
     setTextEditor(null);
     setTextValue('');
@@ -382,6 +468,13 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   const handleMouseDown = async (e: any) => {
+    if (tool === 'select') {
+      // Click on empty canvas clears the selection; clicks on shapes are handled
+      // by their own onClick (select) and Konva's built-in dragging.
+      if (e.target === e.target.getStage()) setSelectedId(null);
+      return;
+    }
+
     if (tool === 'text') {
       // If an editor is already open, its onBlur will commit it — don't open
       // another on the same click.
@@ -452,6 +545,12 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     if (lastShape) {
       socketRef.current?.emit('draw-shape', { roomId, shape: lastShape });
     }
+    // Miro-style: after placing a discrete shape, drop back to the cursor so it
+    // can be moved/resized immediately. Pen/eraser stay active for repeat drawing.
+    if (lastShape && (lastShape.tool === 'rect' || lastShape.tool === 'circle')) {
+      setTool('select');
+      setSelectedId(lastShape.id);
+    }
   };
 
   return (
@@ -509,13 +608,24 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
           {shapes.map((shape, i) => {
             // Videos are rendered as HTML overlays (below), not Konva nodes.
             if (shape.tool === 'video') return null;
+            const selectable = tool === 'select';
             if (shape.tool === 'image') {
-              return <URLImage key={shape.id} shape={shape} onClick={() => handleShapeClick(i)} />;
+              return (
+                <URLImage
+                  key={shape.id}
+                  shape={shape}
+                  onClick={() => handleShapeClick(i)}
+                  draggable={selectable}
+                  onDragEnd={handleDragEnd(shape.id)}
+                  onTransformEnd={handleTransformEnd(shape.id)}
+                />
+              );
             }
             if (shape.tool === 'text') {
               return (
                 <Text
                   key={shape.id}
+                  id={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   x={shape.x}
@@ -523,7 +633,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   text={shape.text}
                   fontSize={shape.strokeWidth || 24}
                   fill={shape.color}
-                  draggable={tool !== 'pen'}
+                  rotation={shape.rotation || 0}
+                  draggable={selectable}
+                  onDragEnd={handleDragEnd(shape.id)}
+                  onTransformEnd={handleTransformEnd(shape.id)}
                 />
               );
             }
@@ -531,8 +644,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
               return (
                 <Line
                   key={shape.id}
+                  id={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
+                  x={shape.x || 0}
+                  y={shape.y || 0}
                   points={shape.points}
                   stroke={shape.color}
                   strokeWidth={shape.strokeWidth}
@@ -541,12 +657,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   lineJoin="round"
                   fill={shape.tool === 'eraser' ? undefined : shape.fill}
                   closed={!!shape.fill}
+                  rotation={shape.rotation || 0}
+                  draggable={selectable}
+                  onDragEnd={handleDragEnd(shape.id)}
+                  onTransformEnd={handleTransformEnd(shape.id)}
                 />
               );
             } else if (shape.tool === 'rect') {
               return (
                 <Rect
                   key={shape.id}
+                  id={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   x={shape.x}
@@ -556,12 +677,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   stroke={shape.color}
                   strokeWidth={shape.strokeWidth}
                   fill={shape.fill || 'transparent'}
+                  rotation={shape.rotation || 0}
+                  draggable={selectable}
+                  onDragEnd={handleDragEnd(shape.id)}
+                  onTransformEnd={handleTransformEnd(shape.id)}
                 />
               );
             } else if (shape.tool === 'circle') {
               return (
                 <Circle
                   key={shape.id}
+                  id={shape.id}
                   onClick={() => handleShapeClick(i)}
                   onTap={() => handleShapeClick(i)}
                   x={shape.x}
@@ -570,10 +696,20 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   stroke={shape.color}
                   strokeWidth={shape.strokeWidth}
                   fill={shape.fill || 'transparent'}
+                  rotation={shape.rotation || 0}
+                  draggable={selectable}
+                  onDragEnd={handleDragEnd(shape.id)}
+                  onTransformEnd={handleTransformEnd(shape.id)}
                 />
               );
             }
           })}
+          {tool === 'select' && (
+            <Transformer
+              ref={transformerRef}
+              boundBoxFunc={(oldBox, newBox) => (newBox.width < 5 || newBox.height < 5 ? oldBox : newBox)}
+            />
+          )}
         </Layer>
       </Stage>
 
