@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
@@ -25,8 +25,123 @@ const URLImage = ({ shape, onClick }: { shape: ShapeData; onClick?: () => void }
   );
 };
 
+// A live, playable YouTube embed rendered as an HTML overlay on top of the canvas
+// (Konva's <canvas> can't host an <iframe>). Draggable by its header bar and
+// resizable from the bottom-right corner; both sync via onLocalChange/onCommit.
+const VIDEO_HEADER_H = 28;
+const VideoEmbed = ({
+  shape,
+  onLocalChange,
+  onCommit,
+  onDelete,
+}: {
+  shape: ShapeData;
+  onLocalChange: (s: ShapeData) => void;
+  onCommit: (s: ShapeData) => void;
+  onDelete: (id: string) => void;
+}) => {
+  const session = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; orig: ShapeData; latest: ShapeData } | null>(null);
+
+  useEffect(() => {
+    const handleMove = (e: PointerEvent) => {
+      const s = session.current;
+      if (!s) return;
+      const dx = e.clientX - s.startX;
+      const dy = e.clientY - s.startY;
+      const next: ShapeData = s.mode === 'move'
+        ? { ...s.orig, x: (s.orig.x || 0) + dx, y: (s.orig.y || 0) + dy }
+        : { ...s.orig, width: Math.max(200, (s.orig.width || 400) + dx), height: Math.max(112, (s.orig.height || 225) + dy) };
+      s.latest = next;
+      onLocalChange(next);
+    };
+    const handleUp = () => {
+      const s = session.current;
+      if (s) { onCommit(s.latest); session.current = null; }
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+  }, [onLocalChange, onCommit]);
+
+  const startDrag = (mode: 'move' | 'resize') => (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    session.current = { mode, startX: e.clientX, startY: e.clientY, orig: shape, latest: shape };
+  };
+
+  const w = shape.width || 400;
+  const h = shape.height || 225;
+
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: shape.y || 0,
+        left: shape.x || 0,
+        width: w,
+        zIndex: 5,
+        borderRadius: 6,
+        overflow: 'hidden',
+        background: '#000',
+        boxShadow: '0 2px 10px rgba(0,0,0,0.25)',
+      }}
+    >
+      <div
+        onPointerDown={startDrag('move')}
+        style={{
+          height: VIDEO_HEADER_H,
+          background: '#1f2937',
+          color: '#fff',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '0 8px',
+          cursor: 'move',
+          fontSize: 12,
+          userSelect: 'none',
+        }}
+      >
+        <span>▶ YouTube</span>
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.stopPropagation(); onDelete(shape.id); }}
+          title="Remove video"
+          style={{ color: '#fca5a5', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}
+        >
+          ✕
+        </button>
+      </div>
+      <iframe
+        src={`https://www.youtube.com/embed/${shape.videoId}`}
+        width={w}
+        height={h}
+        style={{ border: 0, display: 'block' }}
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        allowFullScreen
+        title={`youtube-${shape.videoId}`}
+      />
+      <div
+        onPointerDown={startDrag('resize')}
+        title="Drag to resize"
+        style={{
+          position: 'absolute',
+          right: 0,
+          bottom: 0,
+          width: 16,
+          height: 16,
+          cursor: 'nwse-resize',
+          background: 'linear-gradient(135deg, transparent 50%, #3b82f6 50%)',
+        }}
+      />
+    </div>
+  );
+};
+
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const { tool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, setShapes } = useStore();
+  const { tool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, setShapes, setBroadcastShape } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -65,6 +180,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     socketRef.current = socket;
     socket.emit('join-room', roomId);
 
+    // Let other components (e.g. the toolbar's Add Video) broadcast new shapes.
+    setBroadcastShape((shape: ShapeData) => socket.emit('draw-shape', { roomId, shape }));
+
     socket.on('draw-shape', (newShape: ShapeData) => {
       addShape(newShape);
     });
@@ -77,9 +195,21 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       updateShapeById(id, shape);
     });
 
+    socket.on('delete-shape', ({ id }: { id: string }) => {
+      removeShapeById(id);
+    });
+
     socket.on('clear-canvas', () => setShapes([]));
 
     const handlePaste = (e: ClipboardEvent) => {
+      // Ignore pastes into form fields (e.g. the Add Video modal input, the text
+      // editor, chat box) — otherwise pasting a link there would ALSO drop it on
+      // the canvas, duplicating it.
+      const active = document.activeElement as HTMLElement | null;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+        return;
+      }
+
       const items = e.clipboardData?.items;
       const text = e.clipboardData?.getData('text');
 
@@ -111,16 +241,15 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         }
       }
 
-      if (text && text.includes('youtube.com/watch')) {
-        const videoId = text.split('v=')[1]?.split('&')[0];
+      if (text && (text.includes('youtube.com/watch') || text.includes('youtu.be/'))) {
+        const videoId = text.split('v=')[1]?.split('&')[0] || text.split('youtu.be/')[1]?.split(/[?&]/)[0];
         if (videoId) {
-          const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/0.jpg`;
           const newShape: ShapeData = {
             id: crypto.randomUUID(),
-            tool: 'image',
-            x: 200, y: 200, width: 320, height: 180,
+            tool: 'video',
+            x: 200, y: 200, width: 400, height: 225,
             color: 'transparent', strokeWidth: 0,
-            imageUrl: thumbnailUrl,
+            videoId,
           };
           addShape(newShape);
           socket.emit('draw-shape', { roomId, shape: newShape });
@@ -132,9 +261,21 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     return () => {
       socket.disconnect();
       socketRef.current = null;
+      setBroadcastShape(null);
       window.removeEventListener('paste', handlePaste);
     };
-  }, [roomId, addShape, prependShape, setShapes, updateShapeById]);
+  }, [roomId, addShape, prependShape, setShapes, updateShapeById, removeShapeById, setBroadcastShape]);
+
+  // Stable handlers for the video overlays (drag = local update; commit = sync).
+  const handleVideoChange = useCallback((s: ShapeData) => updateShapeById(s.id, s), [updateShapeById]);
+  const handleVideoCommit = useCallback((s: ShapeData) => {
+    updateShapeById(s.id, s);
+    socketRef.current?.emit('update-shape', { roomId, id: s.id, shape: s });
+  }, [updateShapeById, roomId]);
+  const handleVideoDelete = useCallback((id: string) => {
+    removeShapeById(id);
+    socketRef.current?.emit('delete-shape', { roomId, id });
+  }, [removeShapeById, roomId]);
 
   const handleShapeClick = (index: number) => {
     if (tool === 'bucket') {
@@ -366,6 +507,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       >
         <Layer>
           {shapes.map((shape, i) => {
+            // Videos are rendered as HTML overlays (below), not Konva nodes.
+            if (shape.tool === 'video') return null;
             if (shape.tool === 'image') {
               return <URLImage key={shape.id} shape={shape} onClick={() => handleShapeClick(i)} />;
             }
@@ -433,6 +576,19 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
           })}
         </Layer>
       </Stage>
+
+      {/* Live YouTube players — HTML overlays positioned over the canvas */}
+      {shapes
+        .filter((s) => s.tool === 'video')
+        .map((s) => (
+          <VideoEmbed
+            key={s.id}
+            shape={s}
+            onLocalChange={handleVideoChange}
+            onCommit={handleVideoCommit}
+            onDelete={handleVideoDelete}
+          />
+        ))}
     </div>
   );
 }

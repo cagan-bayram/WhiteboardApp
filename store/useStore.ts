@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type Tool = 'pen' | 'eraser' | 'rect' | 'circle' | 'image' | 'text' | 'bucket';
+export type Tool = 'pen' | 'eraser' | 'rect' | 'circle' | 'image' | 'text' | 'bucket' | 'video';
 
 export interface ShapeData {
   id: string;
@@ -16,6 +16,7 @@ export interface ShapeData {
   color: string;
   strokeWidth: number;
   imageUrl?: string;
+  videoId?: string;
 }
 
 interface AppState {
@@ -32,6 +33,12 @@ interface AppState {
   prependShape: (shape: ShapeData) => void;
   updateShape: (index: number, shape: ShapeData) => void;
   updateShapeById: (id: string, shape: ShapeData) => void;
+  removeShapeById: (id: string) => void;
+
+  // Registered by the Whiteboard so other components (e.g. the board toolbar)
+  // can broadcast a newly added shape over the socket without owning it.
+  broadcastShape: ((shape: ShapeData) => void) | null;
+  setBroadcastShape: (fn: ((shape: ShapeData) => void) | null) => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -58,4 +65,8 @@ export const useStore = create<AppState>((set) => ({
     newShapes[index] = shape;
     return { shapes: newShapes };
   }),
+  removeShapeById: (id) => set((state) => ({ shapes: state.shapes.filter((s) => s.id !== id) })),
+
+  broadcastShape: null,
+  setBroadcastShape: (broadcastShape) => set({ broadcastShape }),
 }));
