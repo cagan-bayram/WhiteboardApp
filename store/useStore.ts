@@ -18,6 +18,10 @@ export interface ShapeData {
   strokeWidth: number;
   imageUrl?: string;
   videoId?: string;
+  // True for full-canvas bucket-fill snapshots. These are background layers, not
+  // real objects: they're excluded from click/marquee selection so a fill can't
+  // swallow the whole board's selection (or be deleted by a stray Delete press).
+  fillLayer?: boolean;
 }
 
 interface AppState {
