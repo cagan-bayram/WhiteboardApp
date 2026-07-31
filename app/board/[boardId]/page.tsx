@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import React from 'react';
 import dynamic from 'next/dynamic';
 import { useRouter } from 'next/navigation';
@@ -33,8 +33,25 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
 
   const { setTool, setColor, setStrokeWidth, tool, shapes, setShapes } = useStore();
 
+  // Which user's board content is already loaded. Loading is keyed on identity
+  // rather than on the auth event, because SIGNED_IN fires for far more than an
+  // actual sign-in: Supabase broadcasts it to every open tab when any one of
+  // them authenticates, and re-emits it when a tab regains focus. Each of those
+  // used to re-run loadBoard(), whose setShapes() overwrote whatever had been
+  // drawn but not yet saved — so merely opening the same board in a second tab
+  // wiped the first tab's work.
+  const loadedForUser = useRef<string | null>(null);
+
   useEffect(() => {
-    const loadBoard = async () => {
+    // A different board means the previous load no longer counts.
+    loadedForUser.current = null;
+
+    const loadBoard = async (userId: string) => {
+      // Same user, board already loaded: nothing to fetch, and re-fetching would
+      // clobber unsaved shapes. Switching accounts still reloads, as it should.
+      if (loadedForUser.current === userId) return;
+      loadedForUser.current = userId;
+
       setLoading(true);
       // No user_id filter: any authenticated user with the link can load the board
       const { data } = await supabase
@@ -52,14 +69,18 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
 
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
-      if (session) loadBoard();
+      if (session) loadBoard(session.user.id);
       else setLoading(false);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      // Only reload board on explicit sign-in; ignore token refreshes to preserve unsaved work
-      if (session && _event === 'SIGNED_IN') loadBoard();
+      if (!session) {
+        // Signed out — the next sign-in should load fresh, even as the same user.
+        loadedForUser.current = null;
+        return;
+      }
+      loadBoard(session.user.id);
     });
 
     return () => subscription.unsubscribe();
