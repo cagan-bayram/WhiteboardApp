@@ -69,6 +69,12 @@ app.prepare().then(() => {
     socket.on('prepend-shape', ({ roomId, shape }) => {
       socket.to(roomId).emit('prepend-shape', shape);
     });
+
+    // Undoing a delete puts the shape back at its original depth, so peers need
+    // the index too — 'draw-shape' would append it and reorder their board.
+    socket.on('insert-shape', ({ roomId, index, shape }) => {
+      socket.to(roomId).emit('insert-shape', { index, shape });
+    });
   });
 
   httpServer.once('error', (err) => {

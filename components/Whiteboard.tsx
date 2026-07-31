@@ -4,8 +4,20 @@ import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react'
 import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage, Transformer } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
-import { useStore, ShapeData } from '@/store/useStore';
+import { useStore, ShapeData, ShapeChange, HistoryEntry, Tool } from '@/store/useStore';
 import Konva from 'konva';
+
+// Single-key tool shortcuts, Miro-style. Only fire without a modifier and never
+// while a form field has focus (see the keydown handler's guard).
+const TOOL_KEYS: Record<string, Tool> = {
+  v: 'select',
+  p: 'pen',
+  r: 'rect',
+  c: 'circle',
+  e: 'eraser',
+  t: 'text',
+  f: 'bucket',
+};
 
 // Shift/Ctrl/Meta all add to the current selection — used by both click-select
 // and the marquee so the two agree on what "additive" means.
@@ -67,7 +79,10 @@ const VideoEmbed = ({
 }: {
   shape: ShapeData;
   onLocalChange: (s: ShapeData) => void;
-  onCommit: (s: ShapeData) => void;
+  // `before` is the shape as it stood when the gesture began. onLocalChange has
+  // already written every intermediate frame into the store, so the caller can't
+  // recover the pre-drag state on its own — it has to come from the session.
+  onCommit: (s: ShapeData, before: ShapeData) => void;
   onDelete: (id: string) => void;
 }) => {
   const session = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; orig: ShapeData; latest: ShapeData } | null>(null);
@@ -86,7 +101,11 @@ const VideoEmbed = ({
     };
     const handleUp = () => {
       const s = session.current;
-      if (s) { onCommit(s.latest); session.current = null; }
+      if (!s) return;
+      // A press with no movement leaves latest identical to orig — nothing to
+      // commit, and recording it would cost an undo step that does nothing.
+      if (s.latest !== s.orig) onCommit(s.latest, s.orig);
+      session.current = null;
     };
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
@@ -171,7 +190,7 @@ const VideoEmbed = ({
 };
 
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const { tool, setTool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, setShapes, setBroadcastShape } = useStore();
+  const { tool, setTool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, insertShapeAt, setShapes, setBroadcastShape, setUndoRedo } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -189,6 +208,68 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   const marqueeRect = useRef<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   // Stable offscreen canvas reused for bucket fill — never recreated across renders
   const fillCanvas = useMemo(() => document.createElement('canvas'), []);
+
+  // Changes recorded for the action currently in flight, flushed on a microtask.
+  // Batching by tick is what makes a gesture one undo step: a group drag fires
+  // dragend once per selected node and the Delete key removes each selected shape
+  // in turn, all synchronously, so they coalesce into a single entry.
+  const pendingChanges = useRef<ShapeChange[]>([]);
+  const recordChange = useCallback((change: ShapeChange) => {
+    if (pendingChanges.current.length === 0) {
+      queueMicrotask(() => {
+        const entry = pendingChanges.current;
+        pendingChanges.current = [];
+        if (entry.length) useStore.getState().pushHistory(entry);
+      });
+    }
+    pendingChanges.current.push(change);
+  }, []);
+
+  // Broadcast the result of an undo/redo. Each change replays as the socket event
+  // the original action would have sent, so peers land on the same state without
+  // needing to know anything about our history stack.
+  const syncEntry = useCallback((entry: HistoryEntry, dir: 'before' | 'after') => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    for (const c of entry) {
+      const target = dir === 'before' ? c.before : c.after;
+      if (!target) {
+        socket.emit('delete-shape', { roomId, id: c.id });
+      } else if (dir === 'before' ? !c.after : !c.before) {
+        // Absent on the other side, so this direction brings the shape back.
+        socket.emit('insert-shape', { roomId, index: c.index, shape: target });
+      } else {
+        socket.emit('update-shape', { roomId, id: c.id, shape: target });
+      }
+    }
+  }, [roomId]);
+
+  // An undone create leaves its id selected but the node gone; drop any id that
+  // no longer resolves so the Transformer doesn't hold a dead handle.
+  const pruneSelection = useCallback(() => {
+    const live = useStore.getState().shapes;
+    setSelectedIds((prev) => prev.filter((id) => live.some((s) => s.id === id)));
+  }, []);
+
+  const handleUndo = useCallback(() => {
+    const entry = useStore.getState().undo();
+    if (!entry) return;
+    syncEntry(entry, 'before');
+    pruneSelection();
+  }, [syncEntry, pruneSelection]);
+
+  const handleRedo = useCallback(() => {
+    const entry = useStore.getState().redo();
+    if (!entry) return;
+    syncEntry(entry, 'after');
+    pruneSelection();
+  }, [syncEntry, pruneSelection]);
+
+  // Let the toolbar's undo/redo buttons drive the same path as the shortcuts.
+  useEffect(() => {
+    setUndoRedo(handleUndo, handleRedo);
+    return () => setUndoRedo(null, null);
+  }, [handleUndo, handleRedo, setUndoRedo]);
 
   const [dimensions, setDimensions] = useState({
     width: window.innerWidth,
@@ -234,26 +315,59 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     tr.getLayer()?.batchDraw();
   }, [selectedIds, tool, shapes]);
 
-  // Delete the current selection (Delete/Backspace) or clear it (Escape).
+  // Board shortcuts: undo/redo, delete the selection, clear it, pick a tool.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Ignore while typing in a form field (text editor, chat, modal inputs).
       const active = document.activeElement as HTMLElement | null;
       if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      if (mod && key === 'z') {
+        e.preventDefault();
+        // Ctrl+Shift+Z and Ctrl+Y both redo — the two conventions users arrive with.
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+        return;
+      }
+      if (mod && key === 'y') {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+      // Leave every other modifier combo to the browser (copy, reload, ...) so a
+      // tool shortcut can't hijack it.
+      if (mod || e.altKey) return;
+
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault();
+        // Snapshot before removing: each change needs the shape's pre-delete
+        // index so undo can restore it at the same depth.
+        const all = useStore.getState().shapes;
         selectedIds.forEach((id) => {
+          const index = all.findIndex((s) => s.id === id);
+          if (index === -1) return;
+          recordChange({ id, index, before: all[index] });
           removeShapeById(id);
           socketRef.current?.emit('delete-shape', { roomId, id });
         });
         setSelectedIds([]);
-      } else if (e.key === 'Escape') {
+        return;
+      }
+      if (e.key === 'Escape') {
         setSelectedIds([]);
+        return;
+      }
+      if (TOOL_KEYS[key]) {
+        e.preventDefault();
+        setTool(TOOL_KEYS[key]);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedIds, removeShapeById, roomId]);
+  }, [selectedIds, removeShapeById, roomId, recordChange, handleUndo, handleRedo, setTool]);
 
   useEffect(() => {
     const socket = io();
@@ -269,6 +383,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
     socket.on('prepend-shape', (newShape: ShapeData) => {
       prependShape(newShape);
+    });
+
+    // A peer undid a delete — restore the shape at the depth it had.
+    socket.on('insert-shape', ({ index, shape }: { index: number; shape: ShapeData }) => {
+      insertShapeAt(index, shape);
     });
 
     socket.on('update-shape', ({ id, shape }: { id: string; shape: ShapeData }) => {
@@ -313,6 +432,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   imageUrl: base64,
                 };
                 addShape(newShape);
+                recordChange({ id: newShape.id, index: useStore.getState().shapes.length - 1, after: newShape });
                 socket.emit('draw-shape', { roomId, shape: newShape });
                 // Pasted images are one-shot inserts: drop to the cursor and
                 // select the new image so it can be moved/resized right away.
@@ -336,6 +456,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             videoId,
           };
           addShape(newShape);
+          recordChange({ id: newShape.id, index: useStore.getState().shapes.length - 1, after: newShape });
           socket.emit('draw-shape', { roomId, shape: newShape });
         }
       }
@@ -348,18 +469,23 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       setBroadcastShape(null);
       window.removeEventListener('paste', handlePaste);
     };
-  }, [roomId, addShape, prependShape, setShapes, updateShapeById, removeShapeById, setBroadcastShape]);
+  }, [roomId, addShape, prependShape, setShapes, updateShapeById, removeShapeById, insertShapeAt, setBroadcastShape, recordChange]);
 
   // Stable handlers for the video overlays (drag = local update; commit = sync).
   const handleVideoChange = useCallback((s: ShapeData) => updateShapeById(s.id, s), [updateShapeById]);
-  const handleVideoCommit = useCallback((s: ShapeData) => {
+  const handleVideoCommit = useCallback((s: ShapeData, before: ShapeData) => {
+    const index = useStore.getState().shapes.findIndex((x) => x.id === s.id);
+    if (index !== -1) recordChange({ id: s.id, index, before, after: s });
     updateShapeById(s.id, s);
     socketRef.current?.emit('update-shape', { roomId, id: s.id, shape: s });
-  }, [updateShapeById, roomId]);
+  }, [updateShapeById, roomId, recordChange]);
   const handleVideoDelete = useCallback((id: string) => {
+    const all = useStore.getState().shapes;
+    const index = all.findIndex((s) => s.id === id);
+    if (index !== -1) recordChange({ id, index, before: all[index] });
     removeShapeById(id);
     socketRef.current?.emit('delete-shape', { roomId, id });
-  }, [removeShapeById, roomId]);
+  }, [removeShapeById, roomId, recordChange]);
 
   // Finish a rubber-band marquee and select what it touched. Bound to a window
   // pointerup (not just the stage's mouseup) so releasing outside the canvas —
@@ -402,13 +528,15 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
   const handleShapeClick = (index: number, e?: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
     if (tool === 'bucket') {
-      const shape = { ...shapes[index] };
+      const before = shapes[index];
+      const shape = { ...before };
       if (shape.tool === 'text') {
         shape.color = color;
       } else {
         shape.fill = color;
       }
       updateShape(index, shape);
+      recordChange({ id: shape.id, index, before, after: shape });
       socketRef.current?.emit('update-shape', { roomId, id: shape.id, shape });
     } else if (tool === 'select') {
       const id = shapes[index].id;
@@ -425,10 +553,16 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   // Reads from the store directly to avoid a stale closure — during a group drag
   // this runs once per member, and a peer's update may have landed mid-gesture.
   const commitNode = (id: string, patch: Partial<ShapeData>) => {
-    const shape = useStore.getState().shapes.find((s) => s.id === id);
-    if (!shape) return;
-    const updated = { ...shape, ...patch };
+    const all = useStore.getState().shapes;
+    const index = all.findIndex((s) => s.id === id);
+    if (index === -1) return;
+    const before = all[index];
+    // Konva fires dragend even for a click that never moved the node. Recording
+    // that would spend an undo step on a no-op, so only log a real change.
+    const changed = (Object.keys(patch) as Array<keyof ShapeData>).some((k) => before[k] !== patch[k]);
+    const updated = { ...before, ...patch };
     updateShapeById(id, updated);
+    if (changed) recordChange({ id, index, before, after: updated });
     socketRef.current?.emit('update-shape', { roomId, id, shape: updated });
   };
 
@@ -548,6 +682,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     // white over black, lands behind the first and is invisible). Strokes drawn
     // afterward are appended later and still render above the fill.
     addShape(newShape);
+    recordChange({ id: newShape.id, index: useStore.getState().shapes.length - 1, after: newShape });
     socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
   };
 
@@ -563,6 +698,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         strokeWidth: 24,
       };
       addShape(newShape);
+      recordChange({ id: newShape.id, index: useStore.getState().shapes.length - 1, after: newShape });
       socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
       // Return to the cursor so the just-placed text can be moved/resized.
       setTool('select');
@@ -605,8 +741,14 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     }
 
     if (tool === 'bucket') {
-      const pos = e.target.getStage().getPointerPosition();
-      if (pos) await handleBucketFill(pos);
+      // Only empty canvas gets the flood-fill snapshot. Without this guard a
+      // bucket click on a shape ran both paths — this one, and the shape's own
+      // onClick recolour — leaving a redundant full-canvas layer stacked on top
+      // of the recoloured shape, and taking two undo steps to unwind.
+      if (e.target === e.target.getStage()) {
+        const pos = e.target.getStage().getPointerPosition();
+        if (pos) await handleBucketFill(pos);
+      }
       return;
     }
 
@@ -679,6 +821,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     const lastShape = currentShapes[currentShapes.length - 1];
     if (lastShape) {
       socketRef.current?.emit('draw-shape', { roomId, shape: lastShape });
+      // The shape was added on mousedown and mutated on every mousemove; record
+      // it once here so the whole stroke is a single undo step, not one per point.
+      recordChange({ id: lastShape.id, index: currentShapes.length - 1, after: lastShape });
     }
     // Miro-style: after placing a discrete shape, drop back to the cursor so it
     // can be moved/resized immediately. Pen/eraser stay active for repeat drawing.
