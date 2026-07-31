@@ -7,6 +7,13 @@ import useImage from 'use-image';
 import { useStore, ShapeData } from '@/store/useStore';
 import Konva from 'konva';
 
+// Shift/Ctrl/Meta all add to the current selection — used by both click-select
+// and the marquee so the two agree on what "additive" means.
+const isAdditive = (evt?: MouseEvent | TouchEvent | null) => {
+  const m = evt as MouseEvent | undefined;
+  return !!(m?.shiftKey || m?.metaKey || m?.ctrlKey);
+};
+
 // Defined at module scope (not inside Whiteboard) so its component identity is
 // stable across renders — otherwise every re-render remounts each image and
 // reloads it via useImage, causing visible flicker while drawing.
@@ -14,12 +21,16 @@ const URLImage = ({
   shape,
   onClick,
   draggable,
+  listening,
+  onDragStart,
   onDragEnd,
   onTransformEnd,
 }: {
   shape: ShapeData;
-  onClick?: () => void;
+  onClick?: (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => void;
   draggable?: boolean;
+  listening?: boolean;
+  onDragStart?: (e: Konva.KonvaEventObject<DragEvent>) => void;
   onDragEnd?: (e: Konva.KonvaEventObject<DragEvent>) => void;
   onTransformEnd?: (e: Konva.KonvaEventObject<Event>) => void;
 }) => {
@@ -36,6 +47,8 @@ const URLImage = ({
       height={shape.height || 200}
       rotation={shape.rotation || 0}
       draggable={draggable}
+      listening={listening}
+      onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       onTransformEnd={onTransformEnd}
     />
@@ -163,8 +176,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   const stageRef = useRef<Konva.Stage>(null);
   const socketRef = useRef<Socket | null>(null);
   const transformerRef = useRef<Konva.Transformer>(null);
-  // Currently selected shape (only meaningful with the 'select' tool).
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Currently selected shapes (only meaningful with the 'select' tool). Supports
+  // multi-select via marquee drag and Shift-click.
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  // Rubber-band marquee rectangle (stage coords) while dragging on empty canvas.
+  const [marquee, setMarquee] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  const marqueeActive = useRef(false);
+  // Whether the in-progress marquee should add to the existing selection (Shift).
+  const marqueeAdditive = useRef(false);
+  // Mirror of `marquee` in a ref so the window-level pointerup finalizer can read
+  // the latest rect without being re-registered on every mousemove.
+  const marqueeRect = useRef<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   // Stable offscreen canvas reused for bucket fill — never recreated across renders
   const fillCanvas = useMemo(() => document.createElement('canvas'), []);
 
@@ -197,18 +219,41 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
   // Leaving the select tool clears any active selection.
   useEffect(() => {
-    if (tool !== 'select') setSelectedId(null);
+    if (tool !== 'select') setSelectedIds([]);
   }, [tool]);
 
-  // Attach the Konva Transformer to the currently selected node.
+  // Attach the Konva Transformer to every currently selected node.
   useEffect(() => {
     const tr = transformerRef.current;
     const stage = stageRef.current;
     if (!tr || !stage) return;
-    const node = tool === 'select' && selectedId ? stage.findOne('#' + selectedId) : null;
-    tr.nodes(node ? [node as Konva.Node] : []);
+    const nodes = tool === 'select'
+      ? selectedIds.map((id) => stage.findOne('#' + id)).filter(Boolean) as Konva.Node[]
+      : [];
+    tr.nodes(nodes);
     tr.getLayer()?.batchDraw();
-  }, [selectedId, tool, shapes]);
+  }, [selectedIds, tool, shapes]);
+
+  // Delete the current selection (Delete/Backspace) or clear it (Escape).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Ignore while typing in a form field (text editor, chat, modal inputs).
+      const active = document.activeElement as HTMLElement | null;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
+        e.preventDefault();
+        selectedIds.forEach((id) => {
+          removeShapeById(id);
+          socketRef.current?.emit('delete-shape', { roomId, id });
+        });
+        setSelectedIds([]);
+      } else if (e.key === 'Escape') {
+        setSelectedIds([]);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedIds, removeShapeById, roomId]);
 
   useEffect(() => {
     const socket = io();
@@ -272,7 +317,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                 // Pasted images are one-shot inserts: drop to the cursor and
                 // select the new image so it can be moved/resized right away.
                 useStore.getState().setTool('select');
-                setSelectedId(newShape.id);
+                setSelectedIds([newShape.id]);
               };
               reader.readAsDataURL(blob);
             }
@@ -316,7 +361,46 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     socketRef.current?.emit('delete-shape', { roomId, id });
   }, [removeShapeById, roomId]);
 
-  const handleShapeClick = (index: number) => {
+  // Finish a rubber-band marquee and select what it touched. Bound to a window
+  // pointerup (not just the stage's mouseup) so releasing outside the canvas —
+  // over the toolbar or past the window edge — can't leave a stuck ghost rect
+  // that blocks every later mousemove. Same pattern as VideoEmbed's drag session.
+  const finalizeMarquee = useCallback(() => {
+    if (!marqueeActive.current) return;
+    marqueeActive.current = false;
+    const stage = stageRef.current;
+    const m = marqueeRect.current;
+    if (stage && m) {
+      const box = {
+        x: Math.min(m.x1, m.x2),
+        y: Math.min(m.y1, m.y2),
+        width: Math.abs(m.x2 - m.x1),
+        height: Math.abs(m.y2 - m.y1),
+      };
+      // A tiny box is really an empty-canvas click — leave the selection cleared.
+      if (box.width >= 3 || box.height >= 3) {
+        const hits = useStore.getState().shapes
+          .filter((s) => s.tool !== 'video' && !s.fillLayer)
+          .filter((s) => {
+            const n = stage.findOne('#' + s.id);
+            return n ? Konva.Util.haveIntersection(box, n.getClientRect()) : false;
+          })
+          .map((s) => s.id);
+        setSelectedIds((prev) =>
+          marqueeAdditive.current ? Array.from(new Set([...prev, ...hits])) : hits
+        );
+      }
+    }
+    marqueeRect.current = null;
+    setMarquee(null);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('pointerup', finalizeMarquee);
+    return () => window.removeEventListener('pointerup', finalizeMarquee);
+  }, [finalizeMarquee]);
+
+  const handleShapeClick = (index: number, e?: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
     if (tool === 'bucket') {
       const shape = { ...shapes[index] };
       if (shape.tool === 'text') {
@@ -327,19 +411,37 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       updateShape(index, shape);
       socketRef.current?.emit('update-shape', { roomId, id: shape.id, shape });
     } else if (tool === 'select') {
-      setSelectedId(shapes[index].id);
+      const id = shapes[index].id;
+      if (isAdditive(e?.evt)) {
+        // Shift/Ctrl-click toggles this shape in/out of the selection.
+        setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+      } else {
+        setSelectedIds([id]);
+      }
     }
   };
 
   // Commit a moved/resized node's geometry back into the store and sync it.
+  // Reads from the store directly to avoid a stale closure — during a group drag
+  // this runs once per member, and a peer's update may have landed mid-gesture.
   const commitNode = (id: string, patch: Partial<ShapeData>) => {
-    const shape = shapes.find((s) => s.id === id);
+    const shape = useStore.getState().shapes.find((s) => s.id === id);
     if (!shape) return;
     const updated = { ...shape, ...patch };
     updateShapeById(id, updated);
     socketRef.current?.emit('update-shape', { roomId, id, shape: updated });
   };
 
+  // Pressing an unselected node selects just it (Miro behavior). Moving a
+  // multi-selection needs no handling here: Konva's Transformer already proxies
+  // the drag to every attached node (Transformer._proxyDrag), so each selected
+  // node moves with the one under the cursor and fires its own dragend.
+  const handleDragStart = (id: string) => () => {
+    if (!selectedIds.includes(id)) setSelectedIds([id]);
+  };
+
+  // Fires once per moved node — including every member of a group drag — so each
+  // commits its own final position.
   const handleDragEnd = (id: string) => (e: Konva.KonvaEventObject<DragEvent>) => {
     commitNode(id, { x: e.target.x(), y: e.target.y() });
   };
@@ -352,7 +454,13 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     // so the stored shape stays clean (scale always 1).
     node.scaleX(1);
     node.scaleY(1);
-    const shape = shapes.find((s) => s.id === id);
+    // Resizing a multi-selection that contains a rotated shape leaves residual
+    // skew on that node (Transformer forces its own rotation to 0 for multiple
+    // nodes, so decompose() yields skew). ShapeData has no skew field, so clear
+    // it — otherwise it desyncs peers and vanishes on the next re-render anyway.
+    node.skewX(0);
+    node.skewY(0);
+    const shape = useStore.getState().shapes.find((s) => s.id === id);
     if (!shape) return;
     const patch: Partial<ShapeData> = { x: node.x(), y: node.y(), rotation: node.rotation() };
     if (shape.tool === 'rect' || shape.tool === 'image') {
@@ -432,6 +540,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       width: stage.width(), height: stage.height(),
       color: 'transparent', strokeWidth: 0,
       imageUrl: dataUrl,
+      // Background snapshot, not a selectable object — see ShapeData.fillLayer.
+      fillLayer: true,
     };
     // Append on top: the fill is a full snapshot of the current canvas, so the
     // newest fill must render above earlier ones (otherwise a second fill, e.g.
@@ -456,7 +566,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       socketRef.current?.emit('draw-shape', { roomId, shape: newShape });
       // Return to the cursor so the just-placed text can be moved/resized.
       setTool('select');
-      setSelectedId(newShape.id);
+      setSelectedIds([newShape.id]);
     }
     setTextEditor(null);
     setTextValue('');
@@ -469,9 +579,19 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
   const handleMouseDown = async (e: any) => {
     if (tool === 'select') {
-      // Click on empty canvas clears the selection; clicks on shapes are handled
-      // by their own onClick (select) and Konva's built-in dragging.
-      if (e.target === e.target.getStage()) setSelectedId(null);
+      // Pressing empty canvas starts a rubber-band marquee. Clicks on shapes are
+      // handled by their own onClick (select) and Konva's built-in dragging.
+      if (e.target === e.target.getStage()) {
+        const pos = e.target.getStage().getPointerPosition();
+        marqueeAdditive.current = isAdditive(e.evt);
+        if (!marqueeAdditive.current) setSelectedIds([]);
+        if (pos) {
+          marqueeActive.current = true;
+          const rect = { x1: pos.x, y1: pos.y, x2: pos.x, y2: pos.y };
+          marqueeRect.current = rect;
+          setMarquee(rect);
+        }
+      }
       return;
     }
 
@@ -515,6 +635,16 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   const handleMouseMove = (e: any) => {
+    if (marqueeActive.current) {
+      const pos = e.target.getStage().getPointerPosition();
+      const prev = marqueeRect.current;
+      if (pos && prev) {
+        const next = { ...prev, x2: pos.x, y2: pos.y };
+        marqueeRect.current = next;
+        setMarquee(next);
+      }
+      return;
+    }
     if (!isDrawing.current) return;
 
     const stage = e.target.getStage();
@@ -537,6 +667,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   const handleMouseUp = () => {
+    if (marqueeActive.current) {
+      finalizeMarquee();
+      return;
+    }
+
     if (!isDrawing.current) return;
     isDrawing.current = false;
     // Read from store directly to avoid stale closure
@@ -549,7 +684,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     // can be moved/resized immediately. Pen/eraser stay active for repeat drawing.
     if (lastShape && (lastShape.tool === 'rect' || lastShape.tool === 'circle')) {
       setTool('select');
-      setSelectedId(lastShape.id);
+      setSelectedIds([lastShape.id]);
     }
   };
 
@@ -610,12 +745,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             if (shape.tool === 'video') return null;
             const selectable = tool === 'select';
             if (shape.tool === 'image') {
+              // Bucket-fill snapshots cover the whole stage. Left interactive
+              // they'd absorb every empty-canvas mousedown, so the marquee could
+              // never start on a filled board. Make them ignore hit detection.
               return (
                 <URLImage
                   key={shape.id}
                   shape={shape}
-                  onClick={() => handleShapeClick(i)}
-                  draggable={selectable}
+                  onClick={(e) => handleShapeClick(i, e)}
+                  draggable={selectable && !shape.fillLayer}
+                  listening={!shape.fillLayer}
+                  onDragStart={handleDragStart(shape.id)}
                   onDragEnd={handleDragEnd(shape.id)}
                   onTransformEnd={handleTransformEnd(shape.id)}
                 />
@@ -626,8 +766,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                 <Text
                   key={shape.id}
                   id={shape.id}
-                  onClick={() => handleShapeClick(i)}
-                  onTap={() => handleShapeClick(i)}
+                  onClick={(e) => handleShapeClick(i, e)}
+                  onTap={(e) => handleShapeClick(i, e)}
                   x={shape.x}
                   y={shape.y}
                   text={shape.text}
@@ -635,6 +775,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   fill={shape.color}
                   rotation={shape.rotation || 0}
                   draggable={selectable}
+                  onDragStart={handleDragStart(shape.id)}
                   onDragEnd={handleDragEnd(shape.id)}
                   onTransformEnd={handleTransformEnd(shape.id)}
                 />
@@ -645,8 +786,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                 <Line
                   key={shape.id}
                   id={shape.id}
-                  onClick={() => handleShapeClick(i)}
-                  onTap={() => handleShapeClick(i)}
+                  onClick={(e) => handleShapeClick(i, e)}
+                  onTap={(e) => handleShapeClick(i, e)}
                   x={shape.x || 0}
                   y={shape.y || 0}
                   points={shape.points}
@@ -659,6 +800,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   closed={!!shape.fill}
                   rotation={shape.rotation || 0}
                   draggable={selectable}
+                  onDragStart={handleDragStart(shape.id)}
                   onDragEnd={handleDragEnd(shape.id)}
                   onTransformEnd={handleTransformEnd(shape.id)}
                 />
@@ -668,8 +810,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                 <Rect
                   key={shape.id}
                   id={shape.id}
-                  onClick={() => handleShapeClick(i)}
-                  onTap={() => handleShapeClick(i)}
+                  onClick={(e) => handleShapeClick(i, e)}
+                  onTap={(e) => handleShapeClick(i, e)}
                   x={shape.x}
                   y={shape.y}
                   width={shape.width}
@@ -679,6 +821,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   fill={shape.fill || 'transparent'}
                   rotation={shape.rotation || 0}
                   draggable={selectable}
+                  onDragStart={handleDragStart(shape.id)}
                   onDragEnd={handleDragEnd(shape.id)}
                   onTransformEnd={handleTransformEnd(shape.id)}
                 />
@@ -688,8 +831,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                 <Circle
                   key={shape.id}
                   id={shape.id}
-                  onClick={() => handleShapeClick(i)}
-                  onTap={() => handleShapeClick(i)}
+                  onClick={(e) => handleShapeClick(i, e)}
+                  onTap={(e) => handleShapeClick(i, e)}
                   x={shape.x}
                   y={shape.y}
                   radius={shape.radius}
@@ -698,12 +841,26 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
                   fill={shape.fill || 'transparent'}
                   rotation={shape.rotation || 0}
                   draggable={selectable}
+                  onDragStart={handleDragStart(shape.id)}
                   onDragEnd={handleDragEnd(shape.id)}
                   onTransformEnd={handleTransformEnd(shape.id)}
                 />
               );
             }
           })}
+          {marquee && (
+            <Rect
+              x={Math.min(marquee.x1, marquee.x2)}
+              y={Math.min(marquee.y1, marquee.y2)}
+              width={Math.abs(marquee.x2 - marquee.x1)}
+              height={Math.abs(marquee.y2 - marquee.y1)}
+              fill="rgba(59,130,246,0.12)"
+              stroke="#3b82f6"
+              strokeWidth={1}
+              dash={[4, 4]}
+              listening={false}
+            />
+          )}
           {tool === 'select' && (
             <Transformer
               ref={transformerRef}
