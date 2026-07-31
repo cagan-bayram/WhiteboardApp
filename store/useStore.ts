@@ -24,11 +24,71 @@ export interface ShapeData {
   fillLayer?: boolean;
 }
 
+// One shape's before/after state for a single undoable action. A missing
+// `before` means the action created the shape; a missing `after` means it
+// deleted it. `index` is the shape's slot in `shapes` — i.e. its z-order — so an
+// undone delete comes back at its original depth instead of on top of the board.
+export interface ShapeChange {
+  id: string;
+  index: number;
+  before?: ShapeData;
+  after?: ShapeData;
+}
+
+// One undo step. A gesture that touches several shapes at once (moving or
+// deleting a multi-selection) records them all in a single entry, so one Ctrl+Z
+// reverses the whole thing rather than peeling it apart one shape at a time.
+export type HistoryEntry = ShapeChange[];
+
+// Bucket fills store a full-canvas PNG data URL, so a handful of them dominates
+// the stack's memory. Cap the depth rather than letting a long session grow
+// without bound.
+const HISTORY_LIMIT = 50;
+
+// Rebuild `shapes` with one side of a history entry applied. Tolerant by design:
+// a peer may have deleted or re-added something since the entry was recorded, so
+// every lookup is by id and missing shapes are simply skipped or re-inserted.
+const applyChanges = (
+  shapes: ShapeData[],
+  entry: HistoryEntry,
+  dir: 'before' | 'after'
+): ShapeData[] => {
+  const targetOf = (c: ShapeChange) => (dir === 'before' ? c.before : c.after);
+
+  // Removals first, so the indices captured when the entry was recorded still
+  // describe the array the re-insertion pass below walks.
+  let next = shapes.filter((s) => !entry.some((c) => c.id === s.id && !targetOf(c)));
+
+  // Shapes that survive on both sides are replaced in place.
+  next = next.map((s) => {
+    const c = entry.find((x) => x.id === s.id);
+    return (c && targetOf(c)) || s;
+  });
+
+  // Shapes the entry brings back. Ascending by index so each insertion lands
+  // before the next one shifts the array.
+  const inserts = entry
+    .filter((c) => targetOf(c) && !shapes.some((s) => s.id === c.id))
+    .sort((a, b) => a.index - b.index);
+  for (const c of inserts) {
+    const at = Math.max(0, Math.min(c.index, next.length));
+    next = [...next.slice(0, at), targetOf(c)!, ...next.slice(at)];
+  }
+
+  return next;
+};
+
 interface AppState {
   tool: Tool;
   color: string;
   strokeWidth: number;
   shapes: ShapeData[];
+
+  // Undo/redo stacks, newest last. Only locally-initiated actions are pushed —
+  // changes arriving over the socket are applied straight to `shapes`, so
+  // Ctrl+Z never reaches across and reverts a collaborator's work.
+  past: HistoryEntry[];
+  future: HistoryEntry[];
 
   setTool: (tool: Tool) => void;
   setColor: (color: string) => void;
@@ -39,18 +99,35 @@ interface AppState {
   updateShape: (index: number, shape: ShapeData) => void;
   updateShapeById: (id: string, shape: ShapeData) => void;
   removeShapeById: (id: string) => void;
+  insertShapeAt: (index: number, shape: ShapeData) => void;
+
+  pushHistory: (entry: HistoryEntry) => void;
+  // Both return the entry they applied (or null when the stack is empty) so the
+  // caller can broadcast the result — the store deliberately knows nothing about
+  // the socket.
+  undo: () => HistoryEntry | null;
+  redo: () => HistoryEntry | null;
 
   // Registered by the Whiteboard so other components (e.g. the board toolbar)
   // can broadcast a newly added shape over the socket without owning it.
   broadcastShape: ((shape: ShapeData) => void) | null;
   setBroadcastShape: (fn: ((shape: ShapeData) => void) | null) => void;
+
+  // Same pattern for undo/redo: the toolbar buttons and the Whiteboard's
+  // keyboard shortcuts must both broadcast, and only the Whiteboard owns the
+  // socket, so it registers the real implementations here.
+  requestUndo: (() => void) | null;
+  requestRedo: (() => void) | null;
+  setUndoRedo: (undo: (() => void) | null, redo: (() => void) | null) => void;
 }
 
-export const useStore = create<AppState>((set) => ({
+export const useStore = create<AppState>((set, get) => ({
   tool: 'select',
   color: '#000000',
   strokeWidth: 5,
   shapes: [],
+  past: [],
+  future: [],
 
   setTool: (tool) => set({ tool }),
   setColor: (color) => set({ color }),
@@ -71,7 +148,48 @@ export const useStore = create<AppState>((set) => ({
     return { shapes: newShapes };
   }),
   removeShapeById: (id) => set((state) => ({ shapes: state.shapes.filter((s) => s.id !== id) })),
+  // Restores a shape at a specific depth. Used when a peer undoes a delete —
+  // appending it would silently reorder their board relative to ours.
+  insertShapeAt: (index, shape) => set((state) => {
+    if (state.shapes.some((s) => s.id === shape.id)) return state;
+    const at = Math.max(0, Math.min(index, state.shapes.length));
+    return { shapes: [...state.shapes.slice(0, at), shape, ...state.shapes.slice(at)] };
+  }),
+
+  pushHistory: (entry) => set((state) => {
+    if (!entry.length) return state;
+    // A fresh action makes any redo branch unreachable, as everywhere else.
+    return { past: [...state.past, entry].slice(-HISTORY_LIMIT), future: [] };
+  }),
+
+  undo: () => {
+    const { past, future, shapes } = get();
+    const entry = past[past.length - 1];
+    if (!entry) return null;
+    set({
+      shapes: applyChanges(shapes, entry, 'before'),
+      past: past.slice(0, -1),
+      future: [...future, entry],
+    });
+    return entry;
+  },
+
+  redo: () => {
+    const { past, future, shapes } = get();
+    const entry = future[future.length - 1];
+    if (!entry) return null;
+    set({
+      shapes: applyChanges(shapes, entry, 'after'),
+      future: future.slice(0, -1),
+      past: [...past, entry],
+    });
+    return entry;
+  },
 
   broadcastShape: null,
   setBroadcastShape: (broadcastShape) => set({ broadcastShape }),
+
+  requestUndo: null,
+  requestRedo: null,
+  setUndoRedo: (requestUndo, requestRedo) => set({ requestUndo, requestRedo }),
 }));

@@ -7,7 +7,7 @@ import { useStore } from '@/store/useStore';
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import Auth from '@/components/Auth';
-import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check, MousePointer2 } from 'lucide-react';
+import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check, MousePointer2, Undo2, Redo2 } from 'lucide-react';
 
 const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
   ssr: false,
@@ -31,7 +31,7 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
     setTimeout(() => setToast(''), 3000);
   };
 
-  const { setTool, setColor, setStrokeWidth, tool, shapes, setShapes } = useStore();
+  const { setTool, setColor, setStrokeWidth, tool, shapes, setShapes, past, future, requestUndo, requestRedo } = useStore();
 
   useEffect(() => {
     const loadBoard = async () => {
@@ -88,6 +88,10 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
       videoId,
     };
     useStore.getState().addShape(shape);
+    // Read the index after the add — it lands on top of whatever is there now.
+    useStore.getState().pushHistory([
+      { id: shape.id, index: useStore.getState().shapes.length - 1, after: shape },
+    ]);
     useStore.getState().broadcastShape?.(shape);
     setVideoUrl('');
     setShowVideoModal(false);
@@ -142,17 +146,34 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
           <span className="text-[9px]">Home</span>
         </button>
         <div className="w-px h-8 bg-gray-300"></div>
-        <button className={`px-4 py-2 rounded ${tool === 'select' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('select')} title="Select / Move / Resize">
+        <button
+          onClick={() => requestUndo?.()}
+          disabled={!past.length}
+          className="p-2 text-gray-700 rounded enabled:hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed"
+          title="Undo (Ctrl+Z)"
+        >
+          <Undo2 size={20} />
+        </button>
+        <button
+          onClick={() => requestRedo?.()}
+          disabled={!future.length}
+          className="p-2 text-gray-700 rounded enabled:hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed"
+          title="Redo (Ctrl+Shift+Z)"
+        >
+          <Redo2 size={20} />
+        </button>
+        <div className="w-px h-8 bg-gray-300"></div>
+        <button className={`px-4 py-2 rounded ${tool === 'select' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('select')} title="Select / Move / Resize (V)">
           <MousePointer2 size={18} />
         </button>
-        <button className={`px-4 py-2 rounded ${tool === 'pen' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('pen')}>Pencil</button>
-        <button className={`px-4 py-2 rounded ${tool === 'rect' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('rect')}>Rect</button>
-        <button className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('circle')}>Circle</button>
-        <button className={`px-4 py-2 rounded ${tool === 'eraser' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('eraser')}>Eraser</button>
-        <button className={`px-4 py-2 rounded ${tool === 'text' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('text')} title="Text Tool">
+        <button className={`px-4 py-2 rounded ${tool === 'pen' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('pen')} title="Pencil (P)">Pencil</button>
+        <button className={`px-4 py-2 rounded ${tool === 'rect' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('rect')} title="Rectangle (R)">Rect</button>
+        <button className={`px-4 py-2 rounded ${tool === 'circle' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('circle')} title="Circle (C)">Circle</button>
+        <button className={`px-4 py-2 rounded ${tool === 'eraser' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('eraser')} title="Eraser (E)">Eraser</button>
+        <button className={`px-4 py-2 rounded ${tool === 'text' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('text')} title="Text Tool (T)">
           <Type size={18} />
         </button>
-        <button className={`px-4 py-2 rounded ${tool === 'bucket' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('bucket')} title="Fill Color">
+        <button className={`px-4 py-2 rounded ${tool === 'bucket' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-black'}`} onClick={() => setTool('bucket')} title="Fill Color (F)">
           <PaintBucket size={18} />
         </button>
         <div className="flex flex-col w-24">
