@@ -108,6 +108,13 @@ interface AppState {
   undo: () => HistoryEntry | null;
   redo: () => HistoryEntry | null;
 
+  // Set once a peer's snapshot has seeded this board on join. The Supabase load
+  // races against that handoff, and Supabase is by definition the staler of the
+  // two — it holds the last *saved* state, while the peer holds the live one — so
+  // a load that resolves second must not overwrite a snapshot that already landed.
+  hydratedFromPeer: boolean;
+  setHydratedFromPeer: (v: boolean) => void;
+
   // Registered by the Whiteboard so other components (e.g. the board toolbar)
   // can broadcast a newly added shape over the socket without owning it.
   broadcastShape: ((shape: ShapeData) => void) | null;
@@ -185,6 +192,9 @@ export const useStore = create<AppState>((set, get) => ({
     });
     return entry;
   },
+
+  hydratedFromPeer: false,
+  setHydratedFromPeer: (hydratedFromPeer) => set({ hydratedFromPeer }),
 
   broadcastShape: null,
   setBroadcastShape: (broadcastShape) => set({ broadcastShape }),

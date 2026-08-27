@@ -22,15 +22,45 @@ app.prepare().then(() => {
     }
   });
 
-  const io = new Server(httpServer);
+  const io = new Server(httpServer, {
+    // Bucket fills are stored as full-canvas PNG data URLs, so a single shape can
+    // run to hundreds of KB and a whole-board snapshot to several MB. socket.io's
+    // 1MB default doesn't error on an oversized payload — it disconnects the
+    // sender — which would show up as a board that mysteriously drops its
+    // connection after a couple of fills.
+    maxHttpBufferSize: 1e7,
+  });
 
   io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
 
-    // Join a specific room (board)
+    // Join a specific room (board), and arrange a state handoff. A client that
+    // joins mid-session would otherwise see only what Supabase had saved plus
+    // whatever is relayed from this moment on, so it would start behind its peers
+    // and stay behind. Asking a peer for a snapshot keeps this file a dumb relay:
+    // the shapes travel through as an opaque payload, and only the clients know
+    // what one means.
     socket.on('join-room', (roomId) => {
+      // Pick the donor before joining, otherwise the room already contains this
+      // socket and it could be asked to seed itself.
+      const members = io.sockets.adapter.rooms.get(roomId);
+      const donorId = members ? members.values().next().value : null;
+
       socket.join(roomId);
       console.log(`Socket ${socket.id} joined room ${roomId}`);
+
+      // An empty room means nobody has newer state than Supabase, so the joiner's
+      // own load is already correct and no handoff is needed.
+      if (donorId) {
+        io.to(donorId).emit('request-state', { requesterId: socket.id });
+      }
+    });
+
+    // The donor's reply, forwarded to the one client that asked for it. If the
+    // donor disconnected in between, `io.to` on a dead id is a no-op and the
+    // joiner simply keeps its Supabase content — the pre-existing behaviour.
+    socket.on('provide-state', ({ requesterId, shapes }) => {
+      io.to(requesterId).emit('board-state', shapes);
     });
 
     // Handle drawing events
