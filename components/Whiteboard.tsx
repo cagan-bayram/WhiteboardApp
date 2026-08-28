@@ -390,6 +390,38 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       insertShapeAt(index, shape);
     });
 
+    // The server picked us to seed a client that just joined. Read through
+    // getState() rather than closing over `shapes`: this listener is registered
+    // once for the life of the connection, so a captured array would be whatever
+    // the board held at mount.
+    socket.on('request-state', ({ requesterId }: { requesterId: string }) => {
+      socket.emit('provide-state', { requesterId, shapes: useStore.getState().shapes });
+    });
+
+    // We joined an existing session and a peer sent us its board. Nothing here is
+    // recorded to history — as with every socket-delivered change, Ctrl+Z must not
+    // reach across and undo work that was never ours.
+    socket.on('board-state', (peerShapes: ShapeData[]) => {
+      if (!Array.isArray(peerShapes)) return;
+      const store = useStore.getState();
+      store.setHydratedFromPeer(true);
+
+      // An empty `past` means the user hasn't touched this board yet, so there is
+      // nothing of ours to lose and the peer's state is strictly newer than the
+      // Supabase row we loaded from. Take it whole.
+      if (store.past.length === 0) {
+        store.setShapes(peerShapes);
+        return;
+      }
+
+      // The handoff was slow enough that the user already started drawing. Add
+      // only what we're missing — insertShapeAt ignores ids we already hold — so a
+      // late snapshot can't discard their strokes. Depths are approximate in this
+      // path, since each insert shifts the indices the rest were measured against,
+      // but a rare ordering quirk beats destroying work.
+      peerShapes.forEach((shape, index) => store.insertShapeAt(index, shape));
+    });
+
     socket.on('update-shape', ({ id, shape }: { id: string; shape: ShapeData }) => {
       updateShapeById(id, shape);
     });

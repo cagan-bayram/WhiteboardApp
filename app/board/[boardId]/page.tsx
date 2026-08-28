@@ -43,8 +43,10 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
   const loadedForUser = useRef<string | null>(null);
 
   useEffect(() => {
-    // A different board means the previous load no longer counts.
+    // A different board means the previous load no longer counts, and no peer has
+    // seeded the new one yet.
     loadedForUser.current = null;
+    useStore.getState().setHydratedFromPeer(false);
 
     const loadBoard = async (userId: string) => {
       // Same user, board already loaded: nothing to fetch, and re-fetching would
@@ -61,7 +63,11 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
         .single();
 
       if (data) {
-        if (data.content) setShapes(data.content);
+        // A peer's snapshot may have landed while this request was in flight. It
+        // reflects the live board; `content` only reflects the last save, so
+        // writing it now would roll the board back to whenever someone last
+        // pressed Save.
+        if (data.content && !useStore.getState().hydratedFromPeer) setShapes(data.content);
         setBoardTitle(data.title || 'Untitled Board');
       }
       setLoading(false);
