@@ -1,6 +1,8 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@/utils/supabase';
+import { withTimeout, describeBackendError } from '@/utils/backend';
+import BackendError from '@/components/BackendError';
 import Auth from '@/components/Auth';
 import NameBoardModal from '@/components/NameBoardModal';
 import UserProfileDropdown from '@/components/UserProfileDropdown';
@@ -8,41 +10,61 @@ import { useRouter } from 'next/navigation';
 import { Plus, LayoutGrid, Trash2, Star } from 'lucide-react';
 
 export default function Dashboard() {
-  const supabase = createClient();
+  // Memoised: createClient() on every render built a fresh client each time, and the
+  // retry callback below has to close over a stable one.
+  const supabase = useMemo(() => createClient(), []);
   const router = useRouter();
   const [session, setSession] = useState<any>(null);
   const [boards, setBoards] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [showNameModal, setShowNameModal] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; title: string } | null>(null);
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+  // Throws rather than swallowing: this used to destructure only `data`, so a failed
+  // query left `boards` empty and the dashboard claimed you had no boards.
+  const fetchBoards = useCallback(async (userId: string) => {
+    const { data, error } = await withTimeout(
+      supabase
+        .from('whiteboards')
+        .select('id, title, created_at, starred')
+        .eq('user_id', userId)
+        .order('starred', { ascending: false })
+        .order('created_at', { ascending: false })
+    );
+
+    if (error) throw error;
+    setBoards(data ?? []);
+  }, [supabase]);
+
+  // Everything the first render waits on, as one retryable unit.
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { data: { session } } = await withTimeout(supabase.auth.getSession());
       setSession(session);
-      if (session) fetchBoards(session.user.id);
-      else setLoading(false);
-    });
+      if (session) await fetchBoards(session.user.id);
+    } catch (e) {
+      setError(describeBackendError(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [supabase, fetchBoards]);
+
+  useEffect(() => {
+    load();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) fetchBoards(session.user.id);
+      // A refresh here can fail just as the initial load can, and dropping it would
+      // put us back to a stale board list with no indication anything went wrong.
+      if (session) fetchBoards(session.user.id).catch((e) => setError(describeBackendError(e)));
     });
 
     return () => subscription.unsubscribe();
-  }, []);
-
-  const fetchBoards = async (userId: string) => {
-    const { data } = await supabase
-      .from('whiteboards')
-      .select('id, title, created_at, starred')
-      .eq('user_id', userId)
-      .order('starred', { ascending: false })
-      .order('created_at', { ascending: false });
-
-    if (data) setBoards(data);
-    setLoading(false);
-  };
+  }, [load, supabase, fetchBoards]);
 
   const createNewBoard = async (title: string) => {
     if (!session) return;
@@ -104,6 +126,9 @@ export default function Dashboard() {
   const regularBoards = boards.filter(b => !b.starred);
 
   if (loading) return <div className="flex h-screen items-center justify-center"><p>Loading...</p></div>;
+  // Before the Auth check: an unreachable backend means we don't know whether there's
+  // a session, and showing a sign-in form would invite a login that can't succeed.
+  if (error) return <BackendError message={error} onRetry={load} retrying={loading} />;
   if (!session) return <Auth />;
 
   return (
