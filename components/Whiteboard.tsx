@@ -1417,7 +1417,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       {menu && (
         <div
           ref={menuRef}
-          className="absolute z-[60] overflow-hidden rounded-lg border bg-white py-1 text-sm shadow-lg"
+          className="absolute z-60 overflow-hidden rounded-lg border bg-white py-1 text-sm shadow-lg"
           style={{
             width: MENU_W,
             // Clamped rather than flipped: near an edge the menu slides back into
