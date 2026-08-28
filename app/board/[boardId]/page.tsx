@@ -6,6 +6,8 @@ import { useRouter } from 'next/navigation';
 import { useStore } from '@/store/useStore';
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
+import { withTimeout, describeBackendError } from '@/utils/backend';
+import BackendError from '@/components/BackendError';
 import Auth from '@/components/Auth';
 import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check, MousePointer2, Undo2, Redo2 } from 'lucide-react';
 
@@ -20,6 +22,10 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
   const supabase = useMemo(() => createClient(), []);
   const [session, setSession] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // Bumped by "Try again". The load lives inside an effect keyed on the board, so
+  // re-running it is a dependency change rather than a separate code path.
+  const [retryToken, setRetryToken] = useState(0);
   const [boardTitle, setBoardTitle] = useState('Untitled Board');
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState('');
@@ -48,6 +54,9 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
     loadedForUser.current = null;
     useStore.getState().setHydratedFromPeer(false);
 
+    // Guards against a resolved request writing into a board we've navigated away from.
+    let cancelled = false;
+
     const loadBoard = async (userId: string) => {
       // Same user, board already loaded: nothing to fetch, and re-fetching would
       // clobber unsaved shapes. Switching accounts still reloads, as it should.
@@ -55,29 +64,53 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
       loadedForUser.current = userId;
 
       setLoading(true);
-      // No user_id filter: any authenticated user with the link can load the board
-      const { data } = await supabase
-        .from('whiteboards')
-        .select('content, title')
-        .eq('id', boardId)
-        .single();
+      setError(null);
+      try {
+        // No user_id filter: any authenticated user with the link can load the board
+        const { data, error } = await withTimeout(
+          supabase
+            .from('whiteboards')
+            .select('content, title')
+            .eq('id', boardId)
+            .single()
+        );
 
-      if (data) {
-        // A peer's snapshot may have landed while this request was in flight. It
-        // reflects the live board; `content` only reflects the last save, so
-        // writing it now would roll the board back to whenever someone last
-        // pressed Save.
-        if (data.content && !useStore.getState().hydratedFromPeer) setShapes(data.content);
-        setBoardTitle(data.title || 'Untitled Board');
+        // Previously only `data` was read, so a failed query fell through to an empty
+        // canvas — indistinguishable from an genuinely empty board, and one Save away
+        // from overwriting real content with nothing.
+        if (error) throw error;
+        if (cancelled) return;
+
+        if (data) {
+          // A peer's snapshot may have landed while this request was in flight. It
+          // reflects the live board; `content` only reflects the last save, so
+          // writing it now would roll the board back to whenever someone last
+          // pressed Save.
+          if (data.content && !useStore.getState().hydratedFromPeer) setShapes(data.content);
+          setBoardTitle(data.title || 'Untitled Board');
+        }
+      } catch (e) {
+        // Release the guard, or "Try again" would short-circuit on the id we recorded
+        // above and never re-fetch.
+        loadedForUser.current = null;
+        if (!cancelled) setError(describeBackendError(e));
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-      setLoading(false);
     };
 
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      if (session) loadBoard(session.user.id);
-      else setLoading(false);
-    });
+    withTimeout(supabase.auth.getSession())
+      .then(({ data: { session } }) => {
+        if (cancelled) return;
+        setSession(session);
+        if (session) loadBoard(session.user.id);
+        else setLoading(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(describeBackendError(e));
+        setLoading(false);
+      });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
@@ -89,8 +122,11 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
       loadBoard(session.user.id);
     });
 
-    return () => subscription.unsubscribe();
-  }, [boardId, supabase, setShapes]);
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
+  }, [boardId, supabase, setShapes, retryToken]);
 
   // Extracts a YouTube video id from either a full watch URL or a youtu.be link.
   const extractVideoId = (url: string): string | null => {
@@ -162,6 +198,11 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
   };
 
   if (loading) return <div className="flex h-screen items-center justify-center">Loading...</div>;
+  // Deliberately ahead of the Whiteboard: rendering a blank canvas for a board whose
+  // contents failed to arrive is how unsaved-looking state becomes real data loss.
+  if (error) {
+    return <BackendError message={error} onRetry={() => setRetryToken((t) => t + 1)} retrying={loading} />;
+  }
   if (!session) return <Auth />;
 
   return (
@@ -268,7 +309,7 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
 
       {/* Transient toast (replaces alert()) */}
       {toast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-gray-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg max-w-[90vw] break-words text-center">
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-gray-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg max-w-[90vw] wrap-break-word text-center">
           {toast}
         </div>
       )}
