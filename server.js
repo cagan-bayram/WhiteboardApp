@@ -105,6 +105,13 @@ app.prepare().then(() => {
     socket.on('insert-shape', ({ roomId, index, shape }) => {
       socket.to(roomId).emit('insert-shape', { index, shape });
     });
+
+    // A z-order change. Carries the whole id sequence rather than "move shape X up
+    // one", because indices only mean the same thing on two boards that already
+    // agree — and a peer mid-stroke doesn't. Ids are cheap enough to send in full.
+    socket.on('reorder-shapes', ({ roomId, ids }) => {
+      socket.to(roomId).emit('reorder-shapes', ids);
+    });
   });
 
   httpServer.once('error', (err) => {

@@ -35,10 +35,34 @@ export interface ShapeChange {
   after?: ShapeData;
 }
 
+// A z-order change touches no shape's data, only where each one sits in the
+// array, so it can't be written as per-shape before/after patches — every patch
+// would be a no-op. Record the whole id order on each side instead.
+export interface OrderChange {
+  kind: 'order';
+  before: string[];
+  after: string[];
+}
+
 // One undo step. A gesture that touches several shapes at once (moving or
 // deleting a multi-selection) records them all in a single entry, so one Ctrl+Z
 // reverses the whole thing rather than peeling it apart one shape at a time.
-export type HistoryEntry = ShapeChange[];
+export type HistoryEntry = ShapeChange[] | OrderChange;
+
+// The two entry kinds are told apart by shape, not by a tag on the array: patch
+// entries stay plain arrays so nothing else about them had to change.
+export const isOrderChange = (entry: HistoryEntry): entry is OrderChange => !Array.isArray(entry);
+
+// Reorder `shapes` to match `ids`. Ids we don't hold are skipped, and shapes the
+// list doesn't mention keep their relative order at the top — a peer that is one
+// stroke ahead of or behind us converges instead of dropping work, and a shape we
+// drew while their reorder was in flight stays where it was drawn: on top.
+export const applyOrder = (shapes: ShapeData[], ids: string[]): ShapeData[] => {
+  const byId = new Map(shapes.map((s) => [s.id, s]));
+  const named = new Set(ids);
+  const ordered = ids.map((id) => byId.get(id)).filter(Boolean) as ShapeData[];
+  return [...ordered, ...shapes.filter((s) => !named.has(s.id))];
+};
 
 // Bucket fills store a full-canvas PNG data URL, so a handful of them dominates
 // the stack's memory. Cap the depth rather than letting a long session grow
@@ -53,6 +77,8 @@ const applyChanges = (
   entry: HistoryEntry,
   dir: 'before' | 'after'
 ): ShapeData[] => {
+  if (isOrderChange(entry)) return applyOrder(shapes, dir === 'before' ? entry.before : entry.after);
+
   const targetOf = (c: ShapeChange) => (dir === 'before' ? c.before : c.after);
 
   // Removals first, so the indices captured when the entry was recorded still
@@ -100,6 +126,9 @@ interface AppState {
   updateShapeById: (id: string, shape: ShapeData) => void;
   removeShapeById: (id: string) => void;
   insertShapeAt: (index: number, shape: ShapeData) => void;
+  // Rewrite the z-order to the given id sequence. Bottom of the array is the
+  // bottom of the board, exactly as it renders.
+  reorderShapes: (ids: string[]) => void;
 
   pushHistory: (entry: HistoryEntry) => void;
   // Both return the entry they applied (or null when the stack is empty) so the
@@ -162,9 +191,10 @@ export const useStore = create<AppState>((set, get) => ({
     const at = Math.max(0, Math.min(index, state.shapes.length));
     return { shapes: [...state.shapes.slice(0, at), shape, ...state.shapes.slice(at)] };
   }),
+  reorderShapes: (ids) => set((state) => ({ shapes: applyOrder(state.shapes, ids) })),
 
   pushHistory: (entry) => set((state) => {
-    if (!entry.length) return state;
+    if (Array.isArray(entry) && !entry.length) return state;
     // A fresh action makes any redo branch unreachable, as everywhere else.
     return { past: [...state.past, entry].slice(-HISTORY_LIMIT), future: [] };
   }),

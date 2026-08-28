@@ -4,14 +4,68 @@ import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react'
 import { Stage, Layer, Line, Rect, Circle, Text, Image as KonvaImage, Transformer } from 'react-konva';
 import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
-import { useStore, ShapeData, ShapeChange, HistoryEntry, Tool } from '@/store/useStore';
+import { useStore, ShapeData, ShapeChange, HistoryEntry, isOrderChange, Tool } from '@/store/useStore';
 import Konva from 'konva';
-import { Minus, Plus } from 'lucide-react';
+import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, Minus, Plus, Trash2 } from 'lucide-react';
 
 // Zoom bounds. Below the floor shapes stop being discernible; above the ceiling a
 // stroke's width exceeds the viewport and panning gets uselessly slow.
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 8;
+
+export type ZMove = 'front' | 'forward' | 'backward' | 'back';
+
+// Work out the new z-order after moving the selection. Returns the full id
+// sequence, bottom first — the same order `shapes` itself is in, which is what
+// gets broadcast and recorded.
+//
+// Bucket fills are the wrinkle. They're full-canvas opaque snapshots, so a shape
+// sent below one doesn't go behind anything meaningful — it disappears. Treat the
+// topmost fill as a floor and reorder only above it. A selected shape that was
+// already buried under a fill gets lifted to the bottom of that region rather than
+// left where no z-order command could ever reach it again.
+export const reorderFor = (shapes: ShapeData[], selected: Set<string>, move: ZMove): string[] => {
+  const floor = shapes.reduce((f, s, i) => (s.fillLayer ? i + 1 : f), 0);
+  const below = shapes.slice(0, floor);
+  const pinned = below.filter((s) => !selected.has(s.id));
+  const movable = [...below.filter((s) => selected.has(s.id)), ...shapes.slice(floor)];
+
+  const isSel = (s: ShapeData) => selected.has(s.id);
+  let out: ShapeData[];
+
+  if (move === 'front' || move === 'back') {
+    const rest = movable.filter((s) => !isSel(s));
+    const chosen = movable.filter(isSel);
+    out = move === 'front' ? [...rest, ...chosen] : [...chosen, ...rest];
+  } else {
+    out = [...movable];
+    if (move === 'forward') {
+      // Top-down, and only past an *unselected* neighbour. Both details matter for
+      // multi-select: walking the other way would carry one shape up repeatedly,
+      // and swapping two selected neighbours would silently reverse them.
+      for (let i = out.length - 2; i >= 0; i--) {
+        if (isSel(out[i]) && !isSel(out[i + 1])) [out[i], out[i + 1]] = [out[i + 1], out[i]];
+      }
+    } else {
+      for (let i = 1; i < out.length; i++) {
+        if (isSel(out[i]) && !isSel(out[i - 1])) [out[i], out[i - 1]] = [out[i - 1], out[i]];
+      }
+    }
+  }
+
+  return [...pinned, ...out].map((s) => s.id);
+};
+
+// Context-menu geometry, needed up front to keep the menu inside the viewport.
+const MENU_W = 208;
+const MENU_H = 186;
+
+const Z_ITEMS: Array<{ move: ZMove; label: string; hint: string; Icon: typeof ChevronsUp }> = [
+  { move: 'front', label: 'Bring to front', hint: 'Ctrl+]', Icon: ChevronsUp },
+  { move: 'forward', label: 'Bring forward', hint: ']', Icon: ChevronUp },
+  { move: 'backward', label: 'Send backward', hint: '[', Icon: ChevronDown },
+  { move: 'back', label: 'Send to back', hint: 'Ctrl+[', Icon: ChevronsDown },
+];
 
 // Single-key tool shortcuts, Miro-style. Only fire without a modifier and never
 // while a form field has focus (see the keydown handler's guard).
@@ -204,7 +258,7 @@ const VideoEmbed = ({
 };
 
 export default function Whiteboard({ roomId }: { roomId: string }) {
-  const { tool, setTool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, insertShapeAt, setShapes, setBroadcastShape, setUndoRedo } = useStore();
+  const { tool, setTool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, insertShapeAt, reorderShapes, setShapes, setBroadcastShape, setUndoRedo } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -212,6 +266,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   // Currently selected shapes (only meaningful with the 'select' tool). Supports
   // multi-select via marquee drag and Shift-click.
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  // Right-click menu, positioned in screen pixels within the canvas container.
+  // Only ever open over a shape — an empty-canvas right-click has nothing to offer.
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   // Rubber-band marquee rectangle (stage coords) while dragging on empty canvas.
   const [marquee, setMarquee] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   const marqueeActive = useRef(false);
@@ -279,6 +337,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   const syncEntry = useCallback((entry: HistoryEntry, dir: 'before' | 'after') => {
     const socket = socketRef.current;
     if (!socket) return;
+    if (isOrderChange(entry)) {
+      socket.emit('reorder-shapes', { roomId, ids: dir === 'before' ? entry.before : entry.after });
+      return;
+    }
     for (const c of entry) {
       const target = dir === 'before' ? c.before : c.after;
       if (!target) {
@@ -319,6 +381,38 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     return () => setUndoRedo(null, null);
   }, [handleUndo, handleRedo, setUndoRedo]);
 
+  // Delete the whole selection as one undo step. Shared by the Delete key and the
+  // context menu so the two can't drift apart.
+  const deleteSelection = useCallback(() => {
+    // Snapshot before removing: each change needs the shape's pre-delete index so
+    // undo can restore it at the same depth.
+    const all = useStore.getState().shapes;
+    selectedIds.forEach((id) => {
+      const index = all.findIndex((s) => s.id === id);
+      if (index === -1) return;
+      recordChange({ id, index, before: all[index] });
+      removeShapeById(id);
+      socketRef.current?.emit('delete-shape', { roomId, id });
+    });
+    setSelectedIds([]);
+  }, [selectedIds, recordChange, removeShapeById, roomId]);
+
+  // Move the selection in z. The whole action is one order entry rather than a
+  // batch of per-shape patches — see OrderChange in the store for why — so it
+  // bypasses recordChange and pushes its own history entry.
+  const applyZOrder = useCallback((move: ZMove) => {
+    if (!selectedIds.length) return;
+    const current = useStore.getState().shapes;
+    const before = current.map((s) => s.id);
+    const after = reorderFor(current, new Set(selectedIds), move);
+    // Already at that depth. Spending an undo step on a no-op would mean Ctrl+Z
+    // appearing to do nothing after a second "bring to front".
+    if (after.every((id, i) => id === before[i])) return;
+    reorderShapes(after);
+    useStore.getState().pushHistory({ kind: 'order', before, after });
+    socketRef.current?.emit('reorder-shapes', { roomId, ids: after });
+  }, [selectedIds, reorderShapes, roomId]);
+
   const [dimensions, setDimensions] = useState({
     width: window.innerWidth,
     height: window.innerHeight,
@@ -346,9 +440,14 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Leaving the select tool clears any active selection.
+  // Leaving the select tool clears any active selection, and with it the menu
+  // that acts on one. Guarded rather than unconditional: opening the menu switches
+  // to select, and closing it in the same pass would undo that.
   useEffect(() => {
-    if (tool !== 'select') setSelectedIds([]);
+    if (tool !== 'select') {
+      setSelectedIds([]);
+      setMenu(null);
+    }
   }, [tool]);
 
   // Panning listens on window, not the stage, so a drag that runs off the canvas
@@ -459,26 +558,26 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       if (mod && (key === '=' || key === '+')) { e.preventDefault(); zoomFromCentre(1.2); return; }
       if (mod && key === '-') { e.preventDefault(); zoomFromCentre(1 / 1.2); return; }
       if (mod && key === '0') { e.preventDefault(); setViewport({ x: 0, y: 0, scale: 1 }); return; }
+      // Z-order, on the bracket keys every design tool uses: plain for one step,
+      // with the modifier for all the way. Handled before the modifier bail-out
+      // below, which is what the Ctrl'd pair would otherwise hit.
+      if (key === ']' || key === '[') {
+        if (!selectedIds.length) return;
+        e.preventDefault();
+        applyZOrder(key === ']' ? (mod ? 'front' : 'forward') : (mod ? 'back' : 'backward'));
+        return;
+      }
       // Leave every other modifier combo to the browser (copy, reload, ...) so a
       // tool shortcut can't hijack it.
       if (mod || e.altKey) return;
 
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault();
-        // Snapshot before removing: each change needs the shape's pre-delete
-        // index so undo can restore it at the same depth.
-        const all = useStore.getState().shapes;
-        selectedIds.forEach((id) => {
-          const index = all.findIndex((s) => s.id === id);
-          if (index === -1) return;
-          recordChange({ id, index, before: all[index] });
-          removeShapeById(id);
-          socketRef.current?.emit('delete-shape', { roomId, id });
-        });
-        setSelectedIds([]);
+        deleteSelection();
         return;
       }
       if (e.key === 'Escape') {
+        setMenu(null);
         setSelectedIds([]);
         return;
       }
@@ -489,7 +588,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedIds, removeShapeById, roomId, recordChange, handleUndo, handleRedo, setTool, zoomFromCentre]);
+  }, [selectedIds, deleteSelection, applyZOrder, handleUndo, handleRedo, setTool, zoomFromCentre]);
 
   useEffect(() => {
     const socket = io();
@@ -550,6 +649,12 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
     socket.on('delete-shape', ({ id }: { id: string }) => {
       removeShapeById(id);
+    });
+
+    // A peer changed the z-order. Not recorded to history — as with every
+    // socket-delivered change, Ctrl+Z must not reach across and undo their work.
+    socket.on('reorder-shapes', (ids: string[]) => {
+      if (Array.isArray(ids)) useStore.getState().reorderShapes(ids);
     });
 
     socket.on('clear-canvas', () => setShapes([]));
@@ -693,7 +798,60 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     return () => window.removeEventListener('pointerup', finalizeMarquee);
   }, [finalizeMarquee]);
 
+  // Right-click opens the shape menu. The browser's own menu is suppressed over
+  // the whole canvas either way — a native "Save image as..." on an infinite board
+  // is never what was meant.
+  const handleContextMenu = (e: Konva.KonvaEventObject<PointerEvent>) => {
+    e.evt.preventDefault();
+    const stage = stageRef.current;
+    const pos = stage?.getPointerPosition();
+    if (!stage || !pos) return;
+
+    // Empty canvas, or a bucket fill (which doesn't listen, so the stage answers
+    // for it): there is nothing to reorder, so show nothing rather than a menu of
+    // dead entries.
+    const targetId = e.target === stage ? '' : e.target.id();
+    if (!targetId) {
+      setMenu(null);
+      return;
+    }
+
+    // Right-clicking outside the selection retargets it, as every editor does;
+    // right-clicking inside one keeps the whole group so the menu acts on all of
+    // it. The tool switch is what makes the selection survive at all — see the
+    // effect above.
+    setTool('select');
+    setSelectedIds((prev) => (prev.includes(targetId) ? prev : [targetId]));
+    setMenu({ x: pos.x, y: pos.y });
+  };
+
+  // Anything outside the menu dismisses it. Registered only while it's open, and
+  // on pointerdown so a click meant for the canvas doesn't also land on a shape.
+  useEffect(() => {
+    if (!menu) return;
+    const onDown = (e: PointerEvent) => {
+      if (!menuRef.current?.contains(e.target as Node)) setMenu(null);
+    };
+    const onWheel = () => setMenu(null);
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('wheel', onWheel);
+    return () => {
+      window.removeEventListener('pointerdown', onDown);
+      window.removeEventListener('wheel', onWheel);
+    };
+  }, [menu]);
+
+  const runFromMenu = (fn: () => void) => () => {
+    fn();
+    setMenu(null);
+  };
+
   const handleShapeClick = (index: number, e?: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+    // Konva raises 'click' for the right button as well as the left, so without
+    // this a right-click would open the menu *and* run the active tool underneath
+    // it — repainting the shape with the bucket, or resetting the selection the
+    // menu was opened on.
+    if ((e?.evt as MouseEvent | undefined)?.button === 2) return;
     if (tool === 'bucket') {
       const before = shapes[index];
       const shape = { ...before };
@@ -891,6 +1049,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   const handleMouseDown = async (e: any) => {
+    // The right button opens the context menu and nothing else. Without this it
+    // fell through to whatever tool was active — starting a marquee that cleared
+    // the selection the menu was about to act on, or laying down a stray stroke.
+    if (e.evt?.button === 2) return;
     // Space-drag and middle-drag pan from anywhere, whatever tool is active, and
     // take precedence over drawing — otherwise a pan would leave a stroke behind.
     if (spaceHeld || e.evt?.button === 1) {
@@ -1083,6 +1245,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         scaleX={viewport.scale}
         scaleY={viewport.scale}
         onWheel={handleWheel}
+        onContextMenu={handleContextMenu}
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
@@ -1248,6 +1411,43 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             />
           ))}
       </div>
+
+      {/* Right-click menu. Above the chat launcher (z-50), which is pinned bottom-right
+          and would otherwise cover the Delete row of a menu opened in that corner. */}
+      {menu && (
+        <div
+          ref={menuRef}
+          className="absolute z-[60] overflow-hidden rounded-lg border bg-white py-1 text-sm shadow-lg"
+          style={{
+            width: MENU_W,
+            // Clamped rather than flipped: near an edge the menu slides back into
+            // view, which keeps it under the cursor instead of jumping across it.
+            left: Math.max(4, Math.min(menu.x, dimensions.width - MENU_W - 4)),
+            top: Math.max(4, Math.min(menu.y, dimensions.height - MENU_H - 4)),
+          }}
+        >
+          {Z_ITEMS.map(({ move, label, hint, Icon }) => (
+            <button
+              key={move}
+              onClick={runFromMenu(() => applyZOrder(move))}
+              className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-gray-700 hover:bg-gray-100"
+            >
+              <Icon size={15} className="shrink-0 text-gray-500" />
+              <span className="flex-1">{label}</span>
+              <kbd className="text-[11px] text-gray-400">{hint}</kbd>
+            </button>
+          ))}
+          <div className="my-1 border-t" />
+          <button
+            onClick={runFromMenu(deleteSelection)}
+            className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-red-600 hover:bg-red-50"
+          >
+            <Trash2 size={15} className="shrink-0" />
+            <span className="flex-1">Delete</span>
+            <kbd className="text-[11px] text-red-300">Del</kbd>
+          </button>
+        </div>
+      )}
 
       {/* Zoom control. Lives here rather than in the board toolbar because the
           viewport is the Whiteboard's own state — putting it in the toolbar would
