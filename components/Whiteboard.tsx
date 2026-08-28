@@ -6,6 +6,12 @@ import { io, Socket } from 'socket.io-client';
 import useImage from 'use-image';
 import { useStore, ShapeData, ShapeChange, HistoryEntry, Tool } from '@/store/useStore';
 import Konva from 'konva';
+import { Minus, Plus } from 'lucide-react';
+
+// Zoom bounds. Below the floor shapes stop being discernible; above the ceiling a
+// stroke's width exceeds the viewport and panning gets uselessly slow.
+const MIN_SCALE = 0.1;
+const MAX_SCALE = 8;
 
 // Single-key tool shortcuts, Miro-style. Only fire without a modifier and never
 // while a form field has focus (see the keydown handler's guard).
@@ -73,11 +79,16 @@ const URLImage = ({
 const VIDEO_HEADER_H = 28;
 const VideoEmbed = ({
   shape,
+  scale,
   onLocalChange,
   onCommit,
   onDelete,
 }: {
   shape: ShapeData;
+  // Current zoom. Pointer deltas arrive in screen pixels but shape geometry is in
+  // board units, so a drag at 2x would otherwise move the video twice as far as the
+  // cursor.
+  scale: number;
   onLocalChange: (s: ShapeData) => void;
   // `before` is the shape as it stood when the gesture began. onLocalChange has
   // already written every intermediate frame into the store, so the caller can't
@@ -91,8 +102,8 @@ const VideoEmbed = ({
     const handleMove = (e: PointerEvent) => {
       const s = session.current;
       if (!s) return;
-      const dx = e.clientX - s.startX;
-      const dy = e.clientY - s.startY;
+      const dx = (e.clientX - s.startX) / scale;
+      const dy = (e.clientY - s.startY) / scale;
       const next: ShapeData = s.mode === 'move'
         ? { ...s.orig, x: (s.orig.x || 0) + dx, y: (s.orig.y || 0) + dy }
         : { ...s.orig, width: Math.max(200, (s.orig.width || 400) + dx), height: Math.max(112, (s.orig.height || 225) + dy) };
@@ -113,7 +124,7 @@ const VideoEmbed = ({
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
     };
-  }, [onLocalChange, onCommit]);
+  }, [onLocalChange, onCommit, scale]);
 
   const startDrag = (mode: 'move' | 'resize') => (e: React.PointerEvent) => {
     e.preventDefault();
@@ -131,6 +142,9 @@ const VideoEmbed = ({
         top: shape.y || 0,
         left: shape.x || 0,
         width: w,
+        // The wrapper opts out of hit-testing so drawing works between videos;
+        // this element opts back in for itself.
+        pointerEvents: 'auto',
         zIndex: 5,
         borderRadius: 6,
         overflow: 'hidden',
@@ -208,6 +222,40 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   const marqueeRect = useRef<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   // Stable offscreen canvas reused for bucket fill — never recreated across renders
   const fillCanvas = useMemo(() => document.createElement('canvas'), []);
+
+  // The camera. Shapes are stored in *board* coordinates; the browser reports
+  // *screen* coordinates; this is the only bridge between them. Deliberately
+  // per-client and never synced — collaborators share a board, not a viewpoint.
+  const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  // Handlers registered on window (panning, paste) outlive the render that created
+  // them, so they read the camera through a ref rather than a stale closure.
+  const viewportRef = useRef(viewport);
+  useEffect(() => { viewportRef.current = viewport; }, [viewport]);
+
+  // Held space turns any drag into a pan, the convention every canvas tool shares.
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const panSession = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+  const [panning, setPanning] = useState(false);
+
+  // Zoom about a fixed screen point: whatever board coordinate sits under the
+  // cursor has to stay under the cursor, which is what makes wheel-zoom feel
+  // anchored instead of drifting toward the origin.
+  const zoomAt = useCallback((screenX: number, screenY: number, factor: number) => {
+    setViewport((v) => {
+      const scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, v.scale * factor));
+      if (scale === v.scale) return v;
+      const boardX = (screenX - v.x) / v.scale;
+      const boardY = (screenY - v.y) / v.scale;
+      return { scale, x: screenX - boardX * scale, y: screenY - boardY * scale };
+    });
+  }, []);
+
+  // Zoom the centre of the viewport — what the on-screen buttons and Ctrl +/- use,
+  // since neither has a cursor position to anchor to.
+  const zoomFromCentre = useCallback((factor: number) => {
+    const stage = stageRef.current;
+    zoomAt((stage?.width() ?? window.innerWidth) / 2, (stage?.height() ?? window.innerHeight) / 2, factor);
+  }, [zoomAt]);
 
   // Changes recorded for the action currently in flight, flushed on a microtask.
   // Batching by tick is what makes a gesture one undo step: a group drag fires
@@ -303,6 +351,75 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     if (tool !== 'select') setSelectedIds([]);
   }, [tool]);
 
+  // Panning listens on window, not the stage, so a drag that runs off the canvas
+  // (or off the browser window) still tracks and still ends cleanly.
+  useEffect(() => {
+    const move = (e: PointerEvent) => {
+      const p = panSession.current;
+      if (!p) return;
+      setViewport((v) => ({ ...v, x: p.origX + (e.clientX - p.startX), y: p.origY + (e.clientY - p.startY) }));
+    };
+    const up = () => {
+      if (!panSession.current) return;
+      panSession.current = null;
+      setPanning(false);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    return () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+  }, []);
+
+  // Space is tracked separately from the shortcut handler below because it needs a
+  // keyup as well, and because it must not fire while a text field has focus.
+  useEffect(() => {
+    const isTyping = () => {
+      const a = document.activeElement as HTMLElement | null;
+      return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable);
+    };
+    const down = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || isTyping()) return;
+      // Space would otherwise scroll the page behind the canvas.
+      e.preventDefault();
+      setSpaceHeld(true);
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.code === 'Space') setSpaceHeld(false);
+    };
+    // Releasing space while the tab is unfocused would otherwise leave it stuck on.
+    const blur = () => setSpaceHeld(false);
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+    };
+  }, []);
+
+  const handleWheel = (e: Konva.KonvaEventObject<WheelEvent>) => {
+    // Always: the page must not scroll underneath the board.
+    e.evt.preventDefault();
+    const stage = stageRef.current;
+    const pointer = stage?.getPointerPosition();
+    if (!stage || !pointer) return;
+
+    // Ctrl/Cmd+wheel is also what browsers synthesise for a trackpad pinch, so this
+    // one branch covers both gestures. A plain wheel pans, as on every other
+    // infinite canvas — scrolling a board that has no scrollbar should move it.
+    if (e.evt.ctrlKey || e.evt.metaKey) {
+      zoomAt(pointer.x, pointer.y, Math.exp(-e.evt.deltaY * 0.002));
+      return;
+    }
+    // Shift redirects a vertical wheel sideways, matching normal scroll behaviour.
+    const dx = e.evt.shiftKey ? e.evt.deltaY : e.evt.deltaX;
+    const dy = e.evt.shiftKey ? 0 : e.evt.deltaY;
+    setViewport((v) => ({ ...v, x: v.x - dx, y: v.y - dy }));
+  };
+
   // Attach the Konva Transformer to every currently selected node.
   useEffect(() => {
     const tr = transformerRef.current;
@@ -337,6 +454,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         handleRedo();
         return;
       }
+      // Zoom shortcuts shadow the browser's own page zoom deliberately: on a canvas
+      // the expected target is the board, not the chrome around it.
+      if (mod && (key === '=' || key === '+')) { e.preventDefault(); zoomFromCentre(1.2); return; }
+      if (mod && key === '-') { e.preventDefault(); zoomFromCentre(1 / 1.2); return; }
+      if (mod && key === '0') { e.preventDefault(); setViewport({ x: 0, y: 0, scale: 1 }); return; }
       // Leave every other modifier combo to the browser (copy, reload, ...) so a
       // tool shortcut can't hijack it.
       if (mod || e.altKey) return;
@@ -367,7 +489,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedIds, removeShapeById, roomId, recordChange, handleUndo, handleRedo, setTool]);
+  }, [selectedIds, removeShapeById, roomId, recordChange, handleUndo, handleRedo, setTool, zoomFromCentre]);
 
   useEffect(() => {
     const socket = io();
@@ -452,11 +574,15 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
               const reader = new FileReader();
               reader.onload = (event) => {
                 const base64 = event.target?.result as string;
+                // Centre of what the user is looking at, in board coordinates —
+                // pasting used to drop images at the screen centre interpreted as
+                // board space, which lands off-screen the moment you pan.
+                const v = viewportRef.current;
                 const newShape: ShapeData = {
                   id: crypto.randomUUID(),
                   tool: 'image',
-                  x: window.innerWidth / 2 - 100,
-                  y: window.innerHeight / 2 - 100,
+                  x: (window.innerWidth / 2 - v.x) / v.scale - 100,
+                  y: (window.innerHeight / 2 - v.y) / v.scale - 100,
                   width: 200,
                   height: 200,
                   color: 'transparent',
@@ -480,10 +606,15 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       if (text && (text.includes('youtube.com/watch') || text.includes('youtu.be/'))) {
         const videoId = text.split('v=')[1]?.split('&')[0] || text.split('youtu.be/')[1]?.split(/[?&]/)[0];
         if (videoId) {
+          const v = viewportRef.current;
           const newShape: ShapeData = {
             id: crypto.randomUUID(),
             tool: 'video',
-            x: 200, y: 200, width: 400, height: 225,
+            // Same reasoning as the pasted image above: near the top-left of what's
+            // currently visible, not of the board.
+            x: (200 - v.x) / v.scale,
+            y: (200 - v.y) / v.scale,
+            width: 400, height: 225,
             color: 'transparent', strokeWidth: 0,
             videoId,
           };
@@ -541,7 +672,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
           .filter((s) => s.tool !== 'video' && !s.fillLayer)
           .filter((s) => {
             const n = stage.findOne('#' + s.id);
-            return n ? Konva.Util.haveIntersection(box, n.getClientRect()) : false;
+            // relativeTo the stage puts the node's box in board coordinates, which
+            // is what `box` is. A bare getClientRect() returns screen coordinates —
+            // identical only at 100% zoom with no pan, so comparing the two silently
+            // selected nothing as soon as the camera moved.
+            return n ? Konva.Util.haveIntersection(box, n.getClientRect({ relativeTo: stage })) : false;
           })
           .map((s) => s.id);
         setSelectedIds((prev) =>
@@ -683,6 +818,10 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     ctx.putImageData(img, 0, 0);
   };
 
+  // `pos` is in screen pixels, not board coordinates — toCanvas() renders the stage
+  // as currently displayed, so the flood fill operates on the visible bitmap. The
+  // shape it produces still has to be placed in board space, or the fill would land
+  // at the board origin no matter where the camera happens to be.
   const handleBucketFill = async (pos: { x: number; y: number }) => {
     const stage = stageRef.current;
     if (!stage) return;
@@ -699,11 +838,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       return;
     }
     const dataUrl = fillCanvas.toDataURL();
+    const v = viewportRef.current;
     const newShape: ShapeData = {
       id: crypto.randomUUID(),
       tool: 'image',
-      x: 0, y: 0,
-      width: stage.width(), height: stage.height(),
+      // Board coordinates of the viewport's top-left corner, and the viewport's
+      // size measured in board units. At scale 1 with no pan this is (0,0) and the
+      // stage size, exactly as before.
+      x: -v.x / v.scale,
+      y: -v.y / v.scale,
+      width: stage.width() / v.scale,
+      height: stage.height() / v.scale,
       color: 'transparent', strokeWidth: 0,
       imageUrl: dataUrl,
       // Background snapshot, not a selectable object — see ShapeData.fillLayer.
@@ -746,11 +891,23 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   const handleMouseDown = async (e: any) => {
+    // Space-drag and middle-drag pan from anywhere, whatever tool is active, and
+    // take precedence over drawing — otherwise a pan would leave a stroke behind.
+    if (spaceHeld || e.evt?.button === 1) {
+      e.evt?.preventDefault?.();
+      const v = viewportRef.current;
+      panSession.current = { startX: e.evt.clientX, startY: e.evt.clientY, origX: v.x, origY: v.y };
+      setPanning(true);
+      return;
+    }
+
     if (tool === 'select') {
       // Pressing empty canvas starts a rubber-band marquee. Clicks on shapes are
       // handled by their own onClick (select) and Konva's built-in dragging.
       if (e.target === e.target.getStage()) {
-        const pos = e.target.getStage().getPointerPosition();
+        // Board coordinates: the marquee is drawn inside the Layer and compared
+        // against shape positions, both of which live in board space.
+        const pos = e.target.getStage().getRelativePointerPosition();
         marqueeAdditive.current = isAdditive(e.evt);
         if (!marqueeAdditive.current) setSelectedIds([]);
         if (pos) {
@@ -767,7 +924,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       // If an editor is already open, its onBlur will commit it — don't open
       // another on the same click.
       if (textEditor) return;
-      const pos = e.target.getStage().getPointerPosition();
+      // Board coordinates: the editor is positioned back into screen space at render
+      // time, and commitText stores these straight onto the shape.
+      const pos = e.target.getStage().getRelativePointerPosition();
       if (pos) setTextEditor({ x: pos.x, y: pos.y });
       return;
     }
@@ -778,6 +937,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       // onClick recolour — leaving a redundant full-canvas layer stacked on top
       // of the recoloured shape, and taking two undo steps to unwind.
       if (e.target === e.target.getStage()) {
+        // Screen coordinates here, unlike everywhere else: the flood fill runs over
+        // a bitmap of what's on screen, so it needs pixel positions in that bitmap.
         const pos = e.target.getStage().getPointerPosition();
         if (pos) await handleBucketFill(pos);
       }
@@ -785,7 +946,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     }
 
     isDrawing.current = true;
-    const pos = e.target.getStage().getPointerPosition();
+    const pos = e.target.getStage().getRelativePointerPosition();
     const id = crypto.randomUUID();
     let newShape: ShapeData;
 
@@ -810,7 +971,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
 
   const handleMouseMove = (e: any) => {
     if (marqueeActive.current) {
-      const pos = e.target.getStage().getPointerPosition();
+      const pos = e.target.getStage().getRelativePointerPosition();
       const prev = marqueeRect.current;
       if (pos && prev) {
         const next = { ...prev, x2: pos.x, y2: pos.y };
@@ -822,7 +983,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     if (!isDrawing.current) return;
 
     const stage = e.target.getStage();
-    const point = stage.getPointerPosition();
+    const point = stage.getRelativePointerPosition();
     const lastShapeIndex = shapes.length - 1;
     if (lastShapeIndex < 0) return;
     const lastShape = { ...shapes[lastShapeIndex] };
@@ -866,7 +1027,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   return (
-    <div className="relative border bg-white shadow-lg overflow-hidden">
+    <div
+      className="relative border bg-white shadow-lg overflow-hidden"
+      // Space-drag pans from anywhere, so advertise it before the drag begins.
+      style={{ cursor: panning ? 'grabbing' : spaceHeld ? 'grab' : undefined }}
+    >
       {textEditor && (
         <textarea
           ref={textareaRef}
@@ -886,11 +1051,15 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
           rows={1}
           style={{
             position: 'absolute',
-            top: textEditor.y,
-            left: textEditor.x,
+            // textEditor holds board coordinates; this is an HTML element layered
+            // over the canvas, so it has to be projected back into screen space by
+            // hand. Konva does this for its own nodes.
+            top: textEditor.y * viewport.scale + viewport.y,
+            left: textEditor.x * viewport.scale + viewport.x,
             zIndex: 30,
             color: color,
-            fontSize: 24,
+            // Matches the 24px the committed Text node will use, at this zoom.
+            fontSize: 24 * viewport.scale,
             lineHeight: 1.2,
             background: '#ffffff',
             border: '2px solid #3b82f6',
@@ -909,6 +1078,11 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         ref={stageRef}
         width={dimensions.width}
         height={dimensions.height}
+        x={viewport.x}
+        y={viewport.y}
+        scaleX={viewport.scale}
+        scaleY={viewport.scale}
+        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
@@ -1047,18 +1221,64 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         </Layer>
       </Stage>
 
-      {/* Live YouTube players — HTML overlays positioned over the canvas */}
-      {shapes
-        .filter((s) => s.tool === 'video')
-        .map((s) => (
-          <VideoEmbed
-            key={s.id}
-            shape={s}
-            onLocalChange={handleVideoChange}
-            onCommit={handleVideoCommit}
-            onDelete={handleVideoDelete}
-          />
-        ))}
+      {/* Live YouTube players — HTML overlays positioned over the canvas. They can't
+          be Konva nodes (a <canvas> can't host an <iframe>), so the stage transform
+          is reproduced here in CSS and each embed keeps using board coordinates.
+          pointerEvents is off on the wrapper so the transparent area between videos
+          doesn't swallow drawing; each embed turns it back on for itself. */}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          pointerEvents: 'none',
+          transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
+          transformOrigin: '0 0',
+        }}
+      >
+        {shapes
+          .filter((s) => s.tool === 'video')
+          .map((s) => (
+            <VideoEmbed
+              key={s.id}
+              shape={s}
+              scale={viewport.scale}
+              onLocalChange={handleVideoChange}
+              onCommit={handleVideoCommit}
+              onDelete={handleVideoDelete}
+            />
+          ))}
+      </div>
+
+      {/* Zoom control. Lives here rather than in the board toolbar because the
+          viewport is the Whiteboard's own state — putting it in the toolbar would
+          mean plumbing the camera through the store for no gain. */}
+      {/* Offset from the right edge to clear the chat launcher, which is pinned at
+          bottom-4 right-4 (ChatInterface.tsx). */}
+      <div className="absolute bottom-4 right-20 z-20 flex items-center gap-1 rounded-lg border bg-white p-1 shadow-md">
+        <button
+          onClick={() => zoomFromCentre(1 / 1.2)}
+          disabled={viewport.scale <= MIN_SCALE}
+          className="rounded p-1.5 text-gray-700 enabled:hover:bg-gray-100 disabled:opacity-30"
+          title="Zoom out (Ctrl+-)"
+        >
+          <Minus size={16} />
+        </button>
+        <button
+          onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
+          className="min-w-14 rounded px-2 py-1 text-xs font-medium tabular-nums text-gray-700 hover:bg-gray-100"
+          title="Reset zoom (Ctrl+0)"
+        >
+          {Math.round(viewport.scale * 100)}%
+        </button>
+        <button
+          onClick={() => zoomFromCentre(1.2)}
+          disabled={viewport.scale >= MAX_SCALE}
+          className="rounded p-1.5 text-gray-700 enabled:hover:bg-gray-100 disabled:opacity-30"
+          title="Zoom in (Ctrl+=)"
+        >
+          <Plus size={16} />
+        </button>
+      </div>
     </div>
   );
 }
