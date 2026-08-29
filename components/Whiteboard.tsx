@@ -593,7 +593,18 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   useEffect(() => {
     const socket = io();
     socketRef.current = socket;
-    socket.emit('join-room', roomId);
+
+    // Join on every connect, not once at mount. socket.io reconnects by itself
+    // after a dropped connection — a sleeping laptop, a changed network, a server
+    // restart — but a reconnect is a *new* socket server-side, and rooms are
+    // per-socket state we don't persist across one. Emitting the join once left a
+    // client connected but in no room, and the break was one-directional: the
+    // server relays on the roomId inside each payload rather than on membership,
+    // so this client's own work still reached everyone while nothing of theirs
+    // came back. Both sides then believe they're in sync until someone mentions a
+    // shape the other can't see. 'connect' fires for the first connection too, so
+    // this covers the initial join as well.
+    socket.on('connect', () => socket.emit('join-room', roomId));
 
     // Let other components (e.g. the toolbar's Add Video) broadcast new shapes.
     setBroadcastShape((shape: ShapeData) => socket.emit('draw-shape', { roomId, shape }));
@@ -1417,7 +1428,7 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
       {menu && (
         <div
           ref={menuRef}
-          className="absolute z-[60] overflow-hidden rounded-lg border bg-white py-1 text-sm shadow-lg"
+          className="absolute z-60 overflow-hidden rounded-lg border bg-white py-1 text-sm shadow-lg"
           style={{
             width: MENU_W,
             // Clamped rather than flipped: near an edge the menu slides back into
