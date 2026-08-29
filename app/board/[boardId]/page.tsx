@@ -4,6 +4,7 @@ import React from 'react';
 import dynamic from 'next/dynamic';
 import { useRouter } from 'next/navigation';
 import { useStore } from '@/store/useStore';
+import { labelForEmail } from '@/utils/presence';
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import { withTimeout, describeBackendError } from '@/utils/backend';
@@ -268,7 +269,10 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
         </button>
       </div>
 
-      <Whiteboard roomId={boardId} />
+      {/* The label collaborators see above this user's cursor. Boards are
+          link-shareable, so this is the one place an account reaches strangers —
+          hence the local part of the address rather than the whole thing. */}
+      <Whiteboard roomId={boardId} userName={labelForEmail(session?.user?.email)} />
       <ChatInterface />
 
       {/* Add Video modal (replaces prompt(), which is blocked in sandboxed embeds) */}
