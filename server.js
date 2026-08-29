@@ -112,6 +112,25 @@ app.prepare().then(() => {
     socket.on('reorder-shapes', ({ roomId, ids }) => {
       socket.to(roomId).emit('reorder-shapes', ids);
     });
+
+    // Presence — who's here, where their pointer is, what they have selected. The
+    // relay stamps the sender's socket id on the way through, because a client
+    // can't be trusted to describe who it is, and both ends derive a peer's colour
+    // from that same id. Everything else in the payload passes through untouched,
+    // as with shapes.
+    socket.on('presence', ({ roomId, ...presence }) => {
+      socket.to(roomId).emit('presence', { id: socket.id, ...presence });
+    });
+
+    // 'disconnecting' rather than 'disconnect': by the time the latter fires the
+    // socket has already left its rooms, so there'd be nobody left to tell. Without
+    // this a departed collaborator's cursor would sit on the board forever.
+    socket.on('disconnecting', () => {
+      for (const room of socket.rooms) {
+        // Every socket is implicitly in a room named after itself; skip that one.
+        if (room !== socket.id) socket.to(room).emit('presence-leave', socket.id);
+      }
+    });
   });
 
   httpServer.once('error', (err) => {

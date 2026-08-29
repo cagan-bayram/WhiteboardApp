@@ -7,11 +7,19 @@ import useImage from 'use-image';
 import { useStore, ShapeData, ShapeChange, HistoryEntry, isOrderChange, Tool } from '@/store/useStore';
 import Konva from 'konva';
 import { ChevronDown, ChevronsDown, ChevronsUp, ChevronUp, Minus, Plus, Trash2 } from 'lucide-react';
+import PeerCursors from './PeerCursors';
+import PeerSelections from './PeerSelections';
+import { PeerPresence } from '@/utils/presence';
 
 // Zoom bounds. Below the floor shapes stop being discernible; above the ceiling a
 // stroke's width exceeds the viewport and panning gets uselessly slow.
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 8;
+
+// Cursor positions go out at most this often. A pointer fires move events far
+// faster than anyone can perceive, and every one of them would be a socket frame
+// to every peer on the board.
+const CURSOR_INTERVAL_MS = 40;
 
 export type ZMove = 'front' | 'forward' | 'backward' | 'back';
 
@@ -257,7 +265,7 @@ const VideoEmbed = ({
   );
 };
 
-export default function Whiteboard({ roomId }: { roomId: string }) {
+export default function Whiteboard({ roomId, userName = 'Someone' }: { roomId: string; userName?: string }) {
   const { tool, setTool, color, strokeWidth, shapes, addShape, prependShape, updateShape, updateShapeById, removeShapeById, insertShapeAt, reorderShapes, setShapes, setBroadcastShape, setUndoRedo } = useStore();
   const isDrawing = useRef(false);
   const stageRef = useRef<Konva.Stage>(null);
@@ -280,6 +288,17 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   const marqueeRect = useRef<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   // Stable offscreen canvas reused for bucket fill — never recreated across renders
   const fillCanvas = useMemo(() => document.createElement('canvas'), []);
+
+  // Sends a presence patch, once the socket exists. Held in a ref so the handlers
+  // that use it — a mousemove, a selection effect — don't have to be rebuilt when
+  // the connection is (re)established.
+  const sendPresence = useRef<((patch: Partial<PeerPresence>) => void) | null>(null);
+  // Last time a cursor position went out, for the throttle.
+  const lastCursorAt = useRef(0);
+  // Read inside the socket effect, which must not be torn down and rebuilt just
+  // because the display name arrived a render later.
+  const userNameRef = useRef(userName);
+  useEffect(() => { userNameRef.current = userName; }, [userName]);
 
   // The camera. Shapes are stored in *board* coordinates; the browser reports
   // *screen* coordinates; this is the only bridge between them. Deliberately
@@ -531,6 +550,16 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     tr.getLayer()?.batchDraw();
   }, [selectedIds, tool, shapes]);
 
+  // Tell the room what we have selected, so nobody else grabs it unawares. Fires
+  // on clear too — an empty array is the message that we've let go. The ref is for
+  // the socket effect, which announces the current selection on every (re)connect
+  // and can't reach through a closure for it.
+  const selectedIdsRef = useRef(selectedIds);
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds;
+    sendPresence.current?.({ selection: selectedIds });
+  }, [selectedIds]);
+
   // Board shortcuts: undo/redo, delete the selection, clear it, pick a tool.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -604,7 +633,35 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     // came back. Both sides then believe they're in sync until someone mentions a
     // shape the other can't see. 'connect' fires for the first connection too, so
     // this covers the initial join as well.
-    socket.on('connect', () => socket.emit('join-room', roomId));
+    socket.on('connect', () => {
+      socket.emit('join-room', roomId);
+      // Announce ourselves on every connect, for the same reason the join is here:
+      // a reconnect is a new socket, and to everyone else we are a new person.
+      // Deliberately no `cursor` key — omitting it leaves whatever peers already
+      // have, so an announcement can't blank a cursor that's still on screen.
+      socket.emit('presence', { roomId, name: userNameRef.current, selection: selectedIdsRef.current });
+    });
+
+    sendPresence.current = (patch) => socket.emit('presence', { roomId, ...patch });
+
+    socket.on('presence', ({ id, ...patch }: { id: string } & Partial<PeerPresence>) => {
+      const store = useStore.getState();
+      const known = id in store.peers;
+      store.mergePeer(id, patch);
+      // Somebody we hadn't heard of. Our own announcement went out before they were
+      // listening, so send it again — otherwise we'd stay invisible to them until
+      // we happened to move. They already know us by the time this comes back, so
+      // it doesn't bounce.
+      if (!known) {
+        socket.emit('presence', { roomId, name: userNameRef.current, selection: selectedIdsRef.current });
+      }
+    });
+
+    socket.on('presence-leave', (id: string) => useStore.getState().removePeer(id));
+
+    // Our own connection dropped: every cursor we're showing is now a ghost, and
+    // the room will re-announce itself when we're back.
+    socket.on('disconnect', () => useStore.getState().clearPeers());
 
     // Let other components (e.g. the toolbar's Add Video) broadcast new shapes.
     setBroadcastShape((shape: ShapeData) => socket.emit('draw-shape', { roomId, shape }));
@@ -745,6 +802,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
     return () => {
       socket.disconnect();
       socketRef.current = null;
+      sendPresence.current = null;
+      useStore.getState().clearPeers();
       setBroadcastShape(null);
       window.removeEventListener('paste', handlePaste);
     };
@@ -1143,6 +1202,16 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
   };
 
   const handleMouseMove = (e: any) => {
+    // Before any of the early returns below: where the pointer is matters to peers
+    // whether or not it's currently drawing something. Board coordinates, so it
+    // lands on the same shape for everyone regardless of their own pan and zoom.
+    const now = Date.now();
+    if (now - lastCursorAt.current >= CURSOR_INTERVAL_MS) {
+      lastCursorAt.current = now;
+      const p = e.target.getStage()?.getRelativePointerPosition();
+      if (p) sendPresence.current?.({ cursor: { x: p.x, y: p.y } });
+    }
+
     if (marqueeActive.current) {
       const pos = e.target.getStage().getRelativePointerPosition();
       const prev = marqueeRect.current;
@@ -1260,6 +1329,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
         onMouseDown={handleMouseDown}
         onMousemove={handleMouseMove}
         onMouseup={handleMouseUp}
+        // Pointer off the canvas: drop our cursor for everyone else rather than
+        // leaving it parked wherever it happened to exit.
+        onMouseLeave={() => sendPresence.current?.({ cursor: null })}
         onTouchStart={handleMouseDown}
         onTouchMove={handleMouseMove}
         onTouchEnd={handleMouseUp}
@@ -1373,6 +1445,9 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
               );
             }
           })}
+          {/* Under the marquee and the Transformer: our own selection UI should
+              always read on top of somebody else's. */}
+          <PeerSelections stage={stageRef.current} />
           {marquee && (
             <Rect
               x={Math.min(marquee.x1, marquee.x2)}
@@ -1422,6 +1497,8 @@ export default function Whiteboard({ roomId }: { roomId: string }) {
             />
           ))}
       </div>
+
+      <PeerCursors viewport={viewport} />
 
       {/* Right-click menu. Above the chat launcher (z-50), which is pinned bottom-right
           and would otherwise cover the Delete row of a menu opened in that corner. */}

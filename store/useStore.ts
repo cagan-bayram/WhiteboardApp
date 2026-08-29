@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { PeerPresence } from '@/utils/presence';
 
 export type Tool = 'select' | 'pen' | 'eraser' | 'rect' | 'circle' | 'image' | 'text' | 'bucket' | 'video';
 
@@ -144,6 +145,17 @@ interface AppState {
   hydratedFromPeer: boolean;
   setHydratedFromPeer: (v: boolean) => void;
 
+  // Everyone else currently on this board, keyed by socket id. Kept in the store
+  // rather than in the Whiteboard's own state on purpose: cursor updates arrive
+  // many times a second, and a component that subscribes only to `peers` re-renders
+  // without dragging the whole shape list along with it.
+  peers: Record<string, PeerPresence>;
+  // Partial by design — a cursor tick carries only a cursor, a selection change
+  // only a selection — so each merges into whatever is already known about them.
+  mergePeer: (id: string, patch: Partial<PeerPresence>) => void;
+  removePeer: (id: string) => void;
+  clearPeers: () => void;
+
   // Registered by the Whiteboard so other components (e.g. the board toolbar)
   // can broadcast a newly added shape over the socket without owning it.
   broadcastShape: ((shape: ShapeData) => void) | null;
@@ -225,6 +237,21 @@ export const useStore = create<AppState>((set, get) => ({
 
   hydratedFromPeer: false,
   setHydratedFromPeer: (hydratedFromPeer) => set({ hydratedFromPeer }),
+
+  peers: {},
+  mergePeer: (id, patch) => set((state) => {
+    // A cursor tick can arrive before the announcement that names them, so a peer
+    // starts with a placeholder rather than being dropped for having no name.
+    const existing: PeerPresence = state.peers[id] ?? { name: 'Someone' };
+    return { peers: { ...state.peers, [id]: { ...existing, ...patch } } };
+  }),
+  removePeer: (id) => set((state) => {
+    if (!state.peers[id]) return state;
+    const next = { ...state.peers };
+    delete next[id];
+    return { peers: next };
+  }),
+  clearPeers: () => set({ peers: {} }),
 
   broadcastShape: null,
   setBroadcastShape: (broadcastShape) => set({ broadcastShape }),
