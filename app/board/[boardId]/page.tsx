@@ -1,16 +1,23 @@
 'use client';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import React from 'react';
 import dynamic from 'next/dynamic';
 import { useRouter } from 'next/navigation';
-import { useStore } from '@/store/useStore';
+
+import { useStore, ShapeData } from '@/store/useStore';
 import { labelForEmail } from '@/utils/presence';
+
 import ChatInterface from '@/components/ChatInterface';
 import { createClient } from '@/utils/supabase';
 import { withTimeout, describeBackendError } from '@/utils/backend';
 import BackendError from '@/components/BackendError';
 import Auth from '@/components/Auth';
-import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check, MousePointer2, Undo2, Redo2 } from 'lucide-react';
+import { Save, LogOut, Video, Type, PaintBucket, Home, Share2, Check, MousePointer2, Undo2, Redo2, Loader2, TriangleAlert } from 'lucide-react';
+
+// How long the board has to sit still before autosave fires. Long enough that a
+// continuous gesture — a stroke, a drag, a resize — is one write rather than
+// dozens, short enough that the unsaved window stays small.
+const AUTOSAVE_DELAY_MS = 2000;
 
 const Whiteboard = dynamic(() => import('@/components/Whiteboard'), {
   ssr: false,
@@ -33,6 +40,18 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
   const [showVideoModal, setShowVideoModal] = useState(false);
   const [videoUrl, setVideoUrl] = useState('');
 
+  // The shapes array we believe the row currently holds, or null when we know it
+  // is behind. Compared by reference, never by value: every store mutation makes
+  // a new array, and shapes can carry multi-megabyte fill snapshots that would
+  // make a deep compare a problem of its own.
+  const [savedShapes, setSavedShapes] = useState<ShapeData[] | null>(null);
+  const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved');
+  // Set only once this board's content has actually come back from the backend.
+  // Autosave is gated on it, because an empty canvas from a failed load looks
+  // exactly like an empty board — and writing that back is the data loss the load
+  // path already goes out of its way to avoid.
+  const [loaded, setLoaded] = useState(false);
+
   const showToast = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(''), 3000);
@@ -53,6 +72,8 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
     // A different board means the previous load no longer counts, and no peer has
     // seeded the new one yet.
     loadedForUser.current = null;
+    setLoaded(false);
+    setSavedShapes(null);
     useStore.getState().setHydratedFromPeer(false);
 
     // Guards against a resolved request writing into a board we've navigated away from.
@@ -87,8 +108,22 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
           // reflects the live board; `content` only reflects the last save, so
           // writing it now would roll the board back to whenever someone last
           // pressed Save.
-          if (data.content && !useStore.getState().hydratedFromPeer) setShapes(data.content);
+          if (useStore.getState().hydratedFromPeer) {
+            // The store is ahead of the row. Leaving `savedShapes` null marks the
+            // board dirty, so autosave brings the row up to the live state.
+            setSavedShapes(null);
+          } else {
+            // Unconditional, including for the empty case. It used to be skipped
+            // when `content` was empty, which left the *previous* board's shapes
+            // in the store after navigating between boards — harmless while saving
+            // was manual, but autosave would now write one board's contents into
+            // another's row.
+            const content: ShapeData[] = data.content ?? [];
+            setShapes(content);
+            setSavedShapes(content);
+          }
           setBoardTitle(data.title || 'Untitled Board');
+          setLoaded(true);
         }
       } catch (e) {
         // Release the guard, or "Try again" would short-circuit on the id we recorded
@@ -161,21 +196,75 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
     setShowVideoModal(false);
   };
 
-  const handleSave = async () => {
+  // Anything drawn since `savedShapes` was recorded is not on the server yet.
+  const dirty = loaded && shapes !== savedShapes;
+
+  const inFlight = useRef<Promise<void> | null>(null);
+
+  // The single save path — the toolbar button, the autosave timer and the flush
+  // before navigating away all come through here. Saves are serialised rather
+  // than dropped when one is already running: a flush that no-opped would skip
+  // exactly the changes it was called to persist.
+  const save = useCallback(async (silent = false) => {
     if (!session) return;
-    // Update (not upsert): the row already exists, and this avoids reassigning
-    // user_id to a collaborator who isn't the original owner.
-    const { error } = await supabase
-      .from('whiteboards')
-      .update({
-        content: shapes,
-        title: boardTitle,
-      })
-      .eq('id', boardId);
-    showToast(error ? 'Error saving: ' + error.message : 'Board saved successfully!');
-  };
+    const run = (async () => {
+      await inFlight.current?.catch(() => {});
+      // Snapshot up front and record *this* array as saved on success. Reading the
+      // store again afterwards would mark work drawn mid-request as already
+      // persisted, which is the quietest way to lose it.
+      const snapshot = useStore.getState().shapes;
+      setSaveState('saving');
+      try {
+        // Update (not upsert): the row already exists, and this avoids reassigning
+        // user_id to a collaborator who isn't the original owner.
+        const { error } = await withTimeout(
+          supabase
+            .from('whiteboards')
+            .update({ content: snapshot, title: boardTitle })
+            .eq('id', boardId)
+        );
+        if (error) throw error;
+        setSavedShapes(snapshot);
+        setSaveState('saved');
+        if (!silent) showToast('Board saved successfully!');
+      } catch (e) {
+        // Left dirty on purpose: the next change reschedules autosave, and the
+        // toolbar button turns into a retry in the meantime.
+        setSaveState('error');
+        showToast('Could not save: ' + describeBackendError(e));
+      }
+    })();
+    inFlight.current = run;
+    await run;
+  }, [session, supabase, boardId, boardTitle]);
+
+  // Autosave. Whiteboard work is continuous and has no natural "done" moment to
+  // press Save at, so until now everything since the last manual press was
+  // discarded — without warning — when the tab closed. Re-running on every change
+  // is what makes this a debounce: each new shape clears the pending timer.
+  useEffect(() => {
+    if (!dirty) return;
+    const timer = setTimeout(() => { save(true); }, AUTOSAVE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [dirty, shapes, save]);
+
+  // The browser's own "leave site?" prompt, for the windows autosave can't cover:
+  // the debounce, a request still in flight, and a save that has just failed.
+  useEffect(() => {
+    if (!dirty && saveState !== 'saving') return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      // Older browsers only honour returnValue.
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [dirty, saveState]);
 
   const handleLogout = async () => {
+    // Client-side navigation never fires beforeunload, so flush by hand — and
+    // before signOut, while there is still a session to save with.
+    if (dirty) await save(true);
     await supabase.auth.signOut();
     setShapes([]);
     // Leave the board URL so the next account to sign in doesn't auto-load this
@@ -194,7 +283,9 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
     }
   };
 
-  const handleGoHome = () => {
+  const handleGoHome = async () => {
+    // Same as logout: a router.push doesn't fire beforeunload.
+    if (dirty) await save(true);
     router.push('/');
   };
 
@@ -259,9 +350,41 @@ export default function BoardPage({ params }: { params: Promise<{ boardId: strin
         <button onClick={() => setShowVideoModal(true)} className="p-2 text-red-600 hover:bg-red-50 rounded" title="Add Video">
           <Video size={20} />
         </button>
-        <button onClick={handleSave} className="p-2 text-green-600 hover:bg-green-50 rounded flex flex-col items-center" title="Save Board">
-          <Save size={20} />
-          <span className="text-[9px]">Save</span>
+        {/* Doubles as the save-state indicator. The board saves itself, so what
+            this mostly does is tell you that it has — and give you something to
+            press when a save has failed. */}
+        <button
+          onClick={() => save()}
+          disabled={saveState === 'saving'}
+          className={`p-2 rounded flex flex-col items-center disabled:cursor-default ${
+            saveState === 'error'
+              ? 'text-red-600 hover:bg-red-50'
+              : dirty || saveState === 'saving'
+                ? 'text-green-600 hover:bg-green-50'
+                : 'text-gray-400 hover:bg-gray-50'
+          }`}
+          title={
+            saveState === 'error'
+              ? 'Last save failed — click to retry'
+              : saveState === 'saving'
+                ? 'Saving...'
+                : dirty
+                  ? 'Unsaved changes — saving shortly, or click to save now'
+                  : 'All changes saved'
+          }
+        >
+          {saveState === 'saving' ? (
+            <Loader2 size={20} className="animate-spin" />
+          ) : saveState === 'error' ? (
+            <TriangleAlert size={20} />
+          ) : dirty ? (
+            <Save size={20} />
+          ) : (
+            <Check size={20} />
+          )}
+          <span className="text-[9px]">
+            {saveState === 'saving' ? 'Saving' : saveState === 'error' ? 'Retry' : dirty ? 'Save' : 'Saved'}
+          </span>
         </button>
         <button onClick={handleLogout} className="p-2 text-red-600 hover:bg-red-50 rounded flex flex-col items-center" title="Logout">
           <LogOut size={20} />
